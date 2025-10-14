@@ -162,10 +162,49 @@ void onUpdateData()
   // Indicate activity with LED
   digitalWrite(LED_BUILTIN, LOW); // Turn on LED to indicate activity
 
-  // Notify MQTT that active reading has started
-  mqtt.publish("everblu/cyble/active_reading", "true", true);
-
+  // CONSERVATIVE APPROACH: Reduce WiFi interference without complete shutdown
+  Serial.println("Reducing WiFi interference for RF operations...");
+  
+  // Pause MQTT and reduce WiFi activity instead of complete disable
+  WiFi.setOutputPower(0); // Reduce WiFi transmission power temporarily
+  yield(); ESP.wdtFeed();
+  
+  // Fresh CC1101 initialization like the successful scanner  
+  Serial.println("Reinitializing CC1101 for clean RF state...");
+  cc1101_init(FREQUENCY);
+  yield(); ESP.wdtFeed();
+  
+  // Brief delay to settle RF state
+  delay(50);
+  ESP.wdtFeed();
+  
+  // Clean RF measurement with minimal WiFi interference
+  // Try standard approach first, then frequency scanning if it fails
+  Serial.println("Attempting meter reading with configured frequency...");
   struct tmeter_data meter_data = get_meter_data(); // Fetch meter data
+  
+  // If standard approach failed, try frequency scanning
+  if (meter_data.reads_counter == 0 && meter_data.liters == 0) {
+    Serial.println("🔍 Standard frequency failed - starting intelligent frequency scan...");
+    Serial.println("This may take 2-3 minutes to test multiple frequencies");
+    meter_data = get_meter_data_with_frequency_scan();
+  }
+  
+  // Restore full WiFi power after RF operations
+  Serial.println("Restoring full WiFi power...");
+  WiFi.setOutputPower(20.5); // Restore full WiFi power (max for ESP8266)
+  yield(); ESP.wdtFeed();
+  
+  // Ensure MQTT is still connected (should be since we never fully disconnected)
+  if (!mqtt.isConnected()) {
+    Serial.println("MQTT disconnected during RF operations, reconnecting...");
+    // Don't force reconnect - let the MQTT library handle it naturally
+    yield(); ESP.wdtFeed();
+  }
+  
+  Serial.println("Starting MQTT data publication...");
+  yield(); ESP.wdtFeed();
+  mqtt.publish("everblu/cyble/active_reading", "false", true);
 
   // Get current UTC time
   time_t tnow = time(nullptr);
@@ -231,14 +270,50 @@ void onUpdateData()
   yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/lqi_percentage", String(calculateLQIToPercentage(meter_data.lqi), DEC), true);   // Publish LQI percentage to MQTT
   yield(); ESP.wdtFeed();
+  
+  // Publish successful frequency information if frequency scanning was used
+  if (meter_data.successful_frequency > 0.0f) {
+    Serial.printf("📡 Publishing successful frequency: %.6f MHz to MQTT\n", meter_data.successful_frequency);
+    
+    // Add memory check before publishing
+    uint32_t freeHeap = ESP.getFreeHeap();
+    Serial.printf("💾 Free heap before frequency publish: %d bytes\n", freeHeap);
+    
+    if (freeHeap > 5000) { // Ensure sufficient memory
+      mqtt.publish("everblu/cyble/successful_frequency", String(meter_data.successful_frequency, 6), true);
+      yield(); ESP.wdtFeed();
+      delay(100); // Brief delay to prevent MQTT overload
+      Serial.printf("✅ Successfully published frequency to MQTT\n");
+    } else {
+      Serial.printf("⚠️ Skipping frequency publish - insufficient memory (%d bytes)\n", freeHeap);
+    }
+  }
 
   // Publish all data as a JSON message as well this is redundant but may be useful for some
-  char json[512];
+  // Use static buffer to prevent stack overflow
+  static char json[512];
+  memset(json, 0, sizeof(json)); // Clear buffer
   sprintf(json, jsonTemplate, meter_data.liters, meter_data.reads_counter, meter_data.battery_left, meter_data.rssi, iso8601);
-  mqtt.publish("everblu/cyble/json", json, true);
+  
+  Serial.println("Publishing JSON data to MQTT...");
+  
+  // Critical: Check memory before final large JSON publish  
+  uint32_t finalHeap = ESP.getFreeHeap();
+  Serial.printf("💾 Free heap before JSON publish: %d bytes\n", finalHeap);
+  
+  if (finalHeap > 3000) { // Ensure sufficient memory for JSON
+    yield(); ESP.wdtFeed();
+    mqtt.publish("everblu/cyble/json", json, true);
+    Serial.println("✅ JSON data published successfully");
+  } else {
+    Serial.printf("⚠️ Skipping JSON publish - insufficient memory (%d bytes)\n", finalHeap);
+  }
+  
+  Serial.println("Finalizing MQTT operations...");
+  yield(); ESP.wdtFeed();
+  delay(200); // Extended delay to prevent system overload
 
-  // Notify MQTT that active reading has ended
-  mqtt.publish("everblu/cyble/active_reading", "false", true);
+  // Note: active_reading "false" already published at line 190 - no need to duplicate
   
   // Reset retry flags on successful read
   _retry = 0;
