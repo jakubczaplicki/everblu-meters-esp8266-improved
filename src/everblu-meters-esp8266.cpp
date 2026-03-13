@@ -317,12 +317,18 @@ void onUpdateData()
   Serial.printf("Data update complete.\n\n");
 }
 
+#define NTP_MIN_VALID_YEAR 121  // 2021 - reject unset/skewed time
+
 // Function: onScheduled
 // Description: Schedules daily meter readings at 10:00 AM UTC.
 void onScheduled()
 {
   time_t tnow = time(nullptr);
   struct tm *ptm = gmtime(&tnow);
+  if (!ptm || ptm->tm_year < NTP_MIN_VALID_YEAR) {
+    mqtt.executeDelayed(500, onScheduled);
+    return; // NTP not synced yet
+  }
 
   // Check if today is a valid reading day
   if (isReadingDay(ptm) && ptm->tm_hour == 10 && ptm->tm_min == 0 && ptm->tm_sec == 0) {
@@ -935,13 +941,24 @@ void onConnectionEstablished()
   Serial.println("Connected to MQTT Broker :)");
 
   Serial.println("> Configure time from NTP server. Please wait...");
-  // Note, my VLAN has no WAN/internet, so I am useing Home Assistant Community Add-on: chrony to proxy the time
   configTzTime("UTC0", secret_local_timeclock_server);
 
-  delay(5000); // Give it a moment for the time to sync the print out the time
+  // Wait for NTP sync (time year >= 2021) or timeout 15s
   time_t tnow = time(nullptr);
+  for (int n = 0; n < 30; n++) {
+    delay(500);
+    tnow = time(nullptr);
+    struct tm *pt = gmtime(&tnow);
+    if (pt && pt->tm_year >= 121) break; // 2021 or later
+    yield();
+    ESP.wdtFeed();
+  }
   struct tm *ptm = gmtime(&tnow);
-  Serial.printf("Current date (UTC) : %04d/%02d/%02d %02d:%02d/%02d - %s\n", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec, String(tnow, DEC).c_str());
+  if (ptm && ptm->tm_year >= 121) {
+    Serial.printf("Current date (UTC) : %04d/%02d/%02d %02d:%02d\n", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min);
+  } else {
+    Serial.println("WARNING: NTP sync may have failed - scheduled readings may be wrong.");
+  }
   
   Serial.println("> Configure Arduino OTA flash.");
   ArduinoOTA.onStart([]() {
