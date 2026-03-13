@@ -543,7 +543,7 @@ struct tmeter_data parse_meter_report(uint8_t *decoded_buffer, uint8_t size)
 // 01234567 ###01234 567###01 234567## #0123456 (# -> Start/Stop bit)
 // is decoded to:
 // 76543210 76543210 76543210 76543210
-uint8_t decode_4bitpbit_serial(uint8_t *rxBuffer, int l_total_byte, uint8_t* decoded_buffer)
+uint8_t decode_4bitpbit_serial(uint8_t *rxBuffer, int l_total_byte, uint8_t* decoded_buffer, int decoded_buffer_max_len)
 {
   uint16_t i, j, k;
   uint8_t bit_cnt = 0;
@@ -552,6 +552,7 @@ uint8_t decode_4bitpbit_serial(uint8_t *rxBuffer, int l_total_byte, uint8_t* dec
   uint8_t dest_bit_cnt = 0;
   uint8_t dest_byte_cnt = 0;
   uint8_t current_Rx_Byte;
+  if (decoded_buffer_max_len <= 0) return 0;
   //show_in_hex(rxBuffer,l_total_byte);
   /*set 1st bit polarity*/
   bit_pol = (rxBuffer[0] & 0x80); //initialize with 1st bit state
@@ -576,18 +577,17 @@ uint8_t decode_4bitpbit_serial(uint8_t *rxBuffer, int l_total_byte, uint8_t* dec
 
         for (k = 0; k < bit_cnt; k++)
         { // insert the number of decoded bit
-          if (dest_bit_cnt < 8)
-          { //if data byte
+          if (dest_bit_cnt < 8 && dest_byte_cnt < (uint8_t)decoded_buffer_max_len)
+          { //if data byte and within buffer
             decoded_buffer[dest_byte_cnt] = decoded_buffer[dest_byte_cnt] >> 1;
             decoded_buffer[dest_byte_cnt] |= bit_pol;
           }
           dest_bit_cnt++;
-          //if ((dest_bit_cnt ==9) && (!bit_pol)){  echo_debug(debug_out,"stop bit error9"); return dest_byte_cnt;}
           if ((dest_bit_cnt == 10) && (!bit_pol)) { echo_debug(debug_out, "stop bit error10"); return dest_byte_cnt; }
           if ((dest_bit_cnt >= 11) && (!bit_pol)) //start bit
           {
             dest_bit_cnt = 0;
-            //echo_debug(debug_out, " dec[%i]=0x%02X \n", dest_byte_cnt, decoded_buffer[dest_byte_cnt]);
+            if (dest_byte_cnt >= (uint8_t)(decoded_buffer_max_len - 1)) return dest_byte_cnt; // overflow protection
             dest_byte_cnt++;
           }
         }
@@ -870,7 +870,7 @@ struct tmeter_data get_meter_data(void)
     //  show_in_hex_array(rxBuffer, rxBuffer_size);
     }
 
-    meter_data_size = decode_4bitpbit_serial(rxBuffer, rxBuffer_size, meter_data);
+    meter_data_size = decode_4bitpbit_serial(rxBuffer, rxBuffer_size, meter_data, (int)sizeof(meter_data));
     Serial.printf("Decoded data size: %d bytes\n", meter_data_size);
     // show_in_hex(meter_data,meter_data_size);
     sdata = parse_meter_report(meter_data, meter_data_size);
