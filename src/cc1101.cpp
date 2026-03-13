@@ -1000,15 +1000,14 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
       continue;
     }
     
-    // Assess signal quality category
-    String signal_quality;
+    // Assess signal quality category (const char* to avoid heap fragmentation)
+    const char* signal_quality;
     if (average_rssi > -70) signal_quality = "EXCELLENT";
-    else if (average_rssi > -85) signal_quality = "GOOD"; 
+    else if (average_rssi > -85) signal_quality = "GOOD";
     else if (average_rssi > -100) signal_quality = "FAIR";
     else if (average_rssi > -115) signal_quality = "POOR";
     else signal_quality = "MARGINAL";
-    
-    Serial.printf("📡 Signal quality: %s (%d dBm)\n", signal_quality.c_str(), average_rssi);
+    Serial.printf("📡 Signal quality: %s (%d dBm)\n", signal_quality, average_rssi);
     
     // Try communication - with retry for promising frequencies
     int communication_attempts = 1;
@@ -1032,25 +1031,25 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
       
       bool valid_data = (sdata.reads_counter > 0 && sdata.liters > 0);
       if (valid_data) {
-        // Assess connection quality
-        String connection_quality;
+        const char* connection_quality;
         if (sdata.rssi_dbm > -70 && sdata.lqi > 100) connection_quality = "EXCELLENT";
         else if (sdata.rssi_dbm > -85 && sdata.lqi > 80) connection_quality = "GOOD";
-        else if (sdata.rssi_dbm > -100 && sdata.lqi > 50) connection_quality = "ADEQUATE";  
+        else if (sdata.rssi_dbm > -100 && sdata.lqi > 50) connection_quality = "ADEQUATE";
         else connection_quality = "MARGINAL";
-        
-        Serial.printf("✅ SUCCESS! Frequency %.6f MHz - %s CONNECTION\n", test_freq, connection_quality.c_str());
-        Serial.printf("📊 Data: %d liters, counter %d, RSSI %d dBm, LQI %d\n", 
+        Serial.printf("✅ SUCCESS! Frequency %.6f MHz - %s CONNECTION\n", test_freq, connection_quality);
+        Serial.printf("📊 Data: %d liters, counter %d, RSSI %d dBm, LQI %d\n",
                       sdata.liters, sdata.reads_counter, sdata.rssi_dbm, sdata.lqi);
-        
-        // For excellent/good connections, return immediately
-        if (connection_quality == "EXCELLENT" || connection_quality == "GOOD") {
+        if (sdata.rssi_dbm > -70 && sdata.lqi > 100) {
           sdata.successful_frequency = test_freq;
           Serial.printf("🎯 RECOMMENDATION: Update FREQUENCY in private.h to %.6f\n", test_freq);
           Serial.printf("🚀 High-quality connection found - ending scan early\n");
           return sdata;
         }
-        
+        if (sdata.rssi_dbm > -85 && sdata.lqi > 80) {
+          sdata.successful_frequency = test_freq;
+          Serial.printf("🎯 RECOMMENDATION: Update FREQUENCY in private.h to %.6f\n", test_freq);
+          return sdata;
+        }
         // Track best adequate connection but continue scanning for better
         if (!got_data || sdata.rssi_dbm > best_attempt.rssi_dbm) {
           best_attempt = sdata;
