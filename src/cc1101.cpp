@@ -364,25 +364,18 @@ void cc1101_configureRF_0(float freq)
   SPIWriteBurstReg(PATABLE_ADDR, PA, 8);
 }
 
-void  cc1101_init(float freq)
+bool cc1101_init(float freq)
 {
   pinMode(GDO0, INPUT_PULLUP);
 
-  // to use SPI pi@MinePi ~ $ gpio unload spi  then gpio load spi   
-  // sinon pas de MOSI ni pas de CSn , buffer de 4kB
-  if ((wiringPiSPISetup(0, 500000)) < 0)        // channel 0 100khz   min 500khz ds la doc ?
-  {
-    //fprintf (stderr, "Can't open the SPI bus: %s\n", strerror (errno)) ;
-    printf("Can't open the SPI bus");
-    exit(EXIT_FAILURE);
+  if (wiringPiSPISetup(0, 500000) < 0) {
+    Serial.println("CC1101: SPI init failed");
+    return false;
   }
   cc1101_reset();
-  delay(1); //1ms
-  //echo_cc1101_version();
-  //delay(1);
-  //show_cc1101_registers_settings();
-  //delay(1);
+  delay(1); // 1ms for chip reset
   cc1101_configureRF_0(freq);
+  return true;
 }
 
 int8_t cc1100_rssi_convert2dbm(uint8_t Rssi_dec)
@@ -961,7 +954,10 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
     Serial.printf("\n--- Testing frequency %.6f MHz (attempt %d/%d) ---\n", test_freq, i+1, freq_count);
     
     // Initialize CC1101 with test frequency
-    cc1101_init(test_freq);
+    if (!cc1101_init(test_freq)) {
+      Serial.printf("CC1101 init failed at %.6f MHz, skipping\n", test_freq);
+      continue;
+    }
     delay(100); // Extended delay for better radio settling
     ESP.wdtFeed();
     

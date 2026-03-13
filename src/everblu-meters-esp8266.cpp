@@ -94,7 +94,10 @@ void scanFrequency433MHz() {
   Serial.printf("###### FREQUENCY DISCOVERY ENABLED (433 MHz) ######\nStarting Frequency Scan...\n");
   for (float i = 433.76f; i < 433.890f; i += 0.0005f) {
       Serial.printf("Test frequency : %f\n", i);
-      cc1101_init(i);
+      if (!cc1101_init(i)) {
+        Serial.println("CC1101 SPI init failed - check wiring");
+        continue;
+      }
       struct tmeter_data meter_data = get_meter_data();
       if (meter_data.reads_counter != 0 || meter_data.liters != 0) {
           Serial.printf("\n------------------------------\nGot frequency : %f\n------------------------------\n", i);
@@ -180,7 +183,14 @@ void onUpdateData()
   
   // Fresh CC1101 initialization like the successful scanner  
   Serial.println("Reinitializing CC1101 for clean RF state...");
-  cc1101_init(FREQUENCY);
+  if (!cc1101_init(FREQUENCY)) {
+    Serial.println("CC1101 init failed - skipping meter read");
+    WiFi.setOutputPower(20.5);
+    mqtt.publish("everblu/cyble/status", "CC1101 init failed", true);
+    mqtt.publish("everblu/cyble/active_reading", "false", true);
+    digitalWrite(LED_BUILTIN, HIGH);
+    return;
+  }
   yield(); ESP.wdtFeed();
   
   // Brief delay to settle RF state
@@ -1346,8 +1356,9 @@ void setup()
   // =====================================================
     
   // Set CC1101 radio frequency
-  cc1101_init(FREQUENCY);
-
+  if (!cc1101_init(FREQUENCY)) {
+    Serial.println("CC1101 init failed - check SPI wiring. System will retry in loop.");
+  }
 }
 
 // Function: loop
