@@ -37,7 +37,7 @@ void show_in_hex_one_line(uint8_t* buffer, size_t len)
 void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
 {
 	 for (size_t i = 0; i < len; i++) {
-	 Serial.printf("%02XS", buffer[i]);
+	 Serial.printf("%02X ", buffer[i]);
 	 }
  }
  
