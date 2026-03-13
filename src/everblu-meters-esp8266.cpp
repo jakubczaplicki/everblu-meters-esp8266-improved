@@ -1228,6 +1228,8 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW); // turned on to start with
 
+  WiFi.persistent(false); // avoid excessive flash writes from WiFi config
+
   // Increase the max packet size to handle large MQTT payloads
   mqtt.setMaxPacketSize(2048); // Set to a size larger than your longest payload
 
