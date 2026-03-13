@@ -902,7 +902,7 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
     for (int j = 0; j < 5; j++) {
       uint8_t rssi_raw = halRfReadReg(RSSI_ADDR);
       int8_t rssi_dbm = cc1100_rssi_convert2dbm(rssi_raw);
-      if ((int)rssi_dbm > -130 && (int)rssi_dbm < 10) { // Valid range (cast for comparison)
+      if (rssi_dbm < 10) { // Reject unrealistically high RSSI; int8_t range -128..127 is valid
         rssi_sum += rssi_dbm;
         valid_readings++;
         Serial.printf("%d ", rssi_dbm);
