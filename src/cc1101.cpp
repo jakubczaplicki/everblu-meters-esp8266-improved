@@ -11,9 +11,6 @@
 #include <SPI.h>            // Include the SPI library for SPI communication
 
 uint8_t RF_config_u8 = 0xFF;
-uint8_t RF_Test_u8 = 0;
-//                     +10,  +7,   5,   0, -10, -15, -20, -30
-uint8_t PA_Test[] = { 0xC0,0xC8,0x85,0x60,0x34,0x1D,0x0E,0x12, };
 uint8_t PA[] = { 0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x00, };
 uint8_t CC1101_status_state = 0;
 uint8_t CC1101_status_FIFO_FreeByte = 0;
@@ -253,23 +250,10 @@ void echo_cc1101_version(void);
 void show_cc1101_registers_settings(void);
 
 //---------------[CC1100 reset functions "200us"]-----------------------
-void cc1101_reset(void)			// reset defined in cc1100 datasheet §19.1
-{// CS should be high from gpio load spi command
-  /* commented car ne fonctionne pas avec wiringPi a voir avec BCM2835 ..
-     digitalWrite(cc1101_CSn, 0);     		// CS low
-     pinMode (cc1101_CSn, OUTPUT);
-     delayMicroseconds(30);
-     digitalWrite(cc1101_CSn, 1);      	// CS high
-     delayMicroseconds(100);	 // min 40us
-  //Pull CSn low and wait for SO to go low
-  digitalWrite(cc1101_CSn, 0);     		// CS low
-  delayMicroseconds(30);
-  */
-
-  CC1101_CMD(SRES);	//GDO0 pin should output a clock signal with a frequency of CLK_XOSC/192.
-  //periode 1/7.417us= 134.8254k  * 192 --> 25.886477M
-  //10 periode 73.83 = 135.4463k *192 --> 26Mhz
-  delay(1); //1ms for getting chip to reset properly
+void cc1101_reset(void)
+{
+  CC1101_CMD(SRES);
+  delay(1); // 1ms for chip reset
 
   CC1101_CMD(SFTX);   //flush the TX_fifo content -> a must for interrupt handling
   CC1101_CMD(SFRX);	//flush the RX_fifo content -> a must for interrupt handling	
@@ -279,8 +263,6 @@ void setMHZ(float mhz) {
   byte freq2 = 0;
   byte freq1 = 0;
   byte freq0 = 0;
-
-  //Serial.printf("%.4f Mhz : ", mhz);
 
   for (bool i = 0; i == 0;) {
     if (mhz >= 26) {
@@ -298,14 +280,6 @@ void setMHZ(float mhz) {
     else { i = 1; }
   }
   if (freq0 > 255) { freq1 += 1; freq0 -= 256; }
-
-  /*
-  Serial.printf("FREQ2=0x%02X ", freq2);
-  Serial.printf("FREQ1=0x%02X ", freq1);
-  Serial.printf("FREQ0=0x%02X ", freq0);
-  Serial.printf("\n");
-  */
-
   halRfWriteReg(FREQ2, freq2);
   halRfWriteReg(FREQ1, freq1);
   halRfWriteReg(FREQ0, freq0);
@@ -321,31 +295,18 @@ void cc1101_configureRF_0(float freq)
   halRfWriteReg(IOCFG0, 0x06);  //GDO0 Output Pin Configuration : Asserts when sync word has been sent / received, and de-asserts at the end of the packet.
   halRfWriteReg(FIFOTHR, 0x47); //0x4? adc with bandwith< 325khz
   halRfWriteReg(SYNC1, 0x55);   //01010101
-  halRfWriteReg(SYNC0, 0x00);   //00000000 
-
-  //halRfWriteReg(PKTCTRL1,0x80);//Preamble quality estimator threshold=16  ; APPEND_STATUS=0; no addr check
-  halRfWriteReg(PKTCTRL1, 0x00);//Preamble quality estimator threshold=0   ; APPEND_STATUS=0; no addr check
-  halRfWriteReg(PKTCTRL0, 0x00);//fix length , no CRC
-  halRfWriteReg(FSCTRL1, 0x08); //Frequency Synthesizer Control
-
+  halRfWriteReg(SYNC0, 0x00);
+  halRfWriteReg(PKTCTRL1, 0x00);
+  halRfWriteReg(PKTCTRL0, 0x00);
+  halRfWriteReg(FSCTRL1, 0x08);
   setMHZ(freq);
-  //halRfWriteReg(FREQ2,0x10);   //Frequency Control Word, High Byte  Base frequency = 433.82
-  //halRfWriteReg(FREQ1,0xAF);   //Frequency Control Word, Middle Byte
-  //halRfWriteReg(FREQ0, freq0);
-  //halRfWriteReg(FREQ0,0x75); //Frequency Control Word, Low Byte la fréquence reel etait 433.790 (centre)
-  //halRfWriteReg(FREQ0,0xC1); //Frequency Control Word, Low Byte rasmobo 814 824 (KO) ; minepi 810 820 (OK)
-  //halRfWriteReg(FREQ0,0x9B); //rasmobo 808.5  -16  pour -38
-  //halRfWriteReg(FREQ0,0xB7);   //rasmobo 810 819.5 OK
-  //mon compteur F1 : 433809500  F2 : 433820000   deviation +-5.25khz depuis 433.81475M
-
   halRfWriteReg(MDMCFG4, 0xF6); //Modem Configuration   RX filter BW = 58Khz
   halRfWriteReg(MDMCFG3, 0x83); //Modem Configuration   26M*((256+83h)*2^6)/2^28 = 2.4kbps 
   halRfWriteReg(MDMCFG2, 0x02); //Modem Configuration   2-FSK;  no Manchester ; 16/16 sync word bits detected
   halRfWriteReg(MDMCFG1, 0x00); //Modem Configuration num preamble 2=>0 , Channel spacing_exp
   halRfWriteReg(MDMCFG0, 0x00); /*# MDMCFG0 Channel spacing = 25Khz*/
   halRfWriteReg(DEVIATN, 0x15);  //5.157471khz 
-  //halRfWriteReg(MCSM1,0x0F);   //CCA always ; default mode RX
-  halRfWriteReg(MCSM1, 0x00);   //CCA always ; default mode IDLE
+  halRfWriteReg(MCSM1, 0x00);
   halRfWriteReg(MCSM0, 0x18);   //Main Radio Control State Machine Configuration
   halRfWriteReg(FOCCFG, 0x1D);  //Frequency Offset Compensation Configuration
   halRfWriteReg(BSCFG, 0x1C);   //Bit Synchronization Configuration
@@ -485,7 +446,6 @@ uint8_t cc1101_check_packet_received(void)
       print_time();
       echo_debug(debug_out, " bytes=%u rssi=%u lqi=%u F_est=%u ", pktLen, l_Rssi_dbm, l_lqi, l_freq_est);
       show_in_hex_one_line(rxBuffer, pktLen);
-      //show_in_bin(rxBuffer,l_nb_byte);		   
     }
     else
     {
@@ -503,17 +463,13 @@ uint8_t cc1101_wait_for_packet(int milliseconds)
   for (i = 0; i < milliseconds; i++)
   {
     delay(1); //in ms	
-    if (i % 100 == 0) ESP.wdtFeed(); // Feed watchdog every 100ms
-    //echo_cc1101_MARCSTATE();
+    if (i % 100 == 0) ESP.wdtFeed();
     if (cc1101_check_packet_received()) //delay till system has data available
     {
       return TRUE;
     }
     else if (i == milliseconds - 1)
-    {
-      //echo_debug(debug_out,"no packet received!\n");
       return FALSE;
-    }
   }
   return TRUE;
 }
@@ -820,10 +776,6 @@ struct tmeter_data get_meter_data(void)
       delay(130); //130ms time to free 39bytes FIFO space
       ESP.wdtFeed(); // Feed watchdog after long delay
       SPIWriteBurstReg(TX_FIFO_ADDR, txbuffer, 39);
-      if (debug_out && 0) {
-        echo_debug(debug_out, "txbuffer:\n");
-        show_in_hex_array(&txbuffer[0], 39);
-      }
       wup2send = 0xFF;
     }
     delay(10); tmo++;
@@ -864,14 +816,8 @@ struct tmeter_data get_meter_data(void)
   if (rxBuffer_size)
   {
     Serial.printf("Second frame (DATA) received successfully - %d bytes\n", rxBuffer_size);
-    if (debug_out) {
-    //  echo_debug(debug_out, "rxBuffer:\n");
-    //  show_in_hex_array(rxBuffer, rxBuffer_size);
-    }
-
     meter_data_size = decode_4bitpbit_serial(rxBuffer, rxBuffer_size, meter_data, (int)sizeof(meter_data));
     Serial.printf("Decoded data size: %d bytes\n", meter_data_size);
-    // show_in_hex(meter_data,meter_data_size);
     sdata = parse_meter_report(meter_data, meter_data_size);
     Serial.printf("Parsed meter data - Liters: %d, Counter: %d, Battery: %d months\n", 
                   sdata.liters, sdata.reads_counter, sdata.battery_left);

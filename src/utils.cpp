@@ -69,12 +69,7 @@ void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
  }
  
  void print_time(void)
- {/*
-	 time_t mytime;
-	 mytime = time(NULL);
-	 printf(ctime(&mytime));*/
-	 
-	 
+{
    time_t rawtime;
    struct tm * timeinfo;
    char buffer [80];
@@ -193,10 +188,8 @@ void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
 	 int j = 0;
 	 
 	for (i=0 ; i < (inputBufferLen * 8) ; i++) {
- //printf("\ni=%u",i);
 		 if (i % 8 == 0) {
 			if (i > 0) {
- //printf(" j=%u stopBIT",j);
 			   // Insert stop bit (3)
 			   bytepos = j / 8;
 			   bitpos = j % 8;
@@ -217,7 +210,6 @@ void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
 			 // Insert start bit (0)
 			 bytepos = j / 8;
 			 bitpos = j % 8;
- //printf(" j=%u startBIT",j);
 			 outputBuffer[bytepos] &= ~(1 << (7 - bitpos));
 			 j++;
 		 }// start stop bit
@@ -263,10 +255,8 @@ void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
    to_encode[6] = (uint8_t)((serial&0x0000FF00)>>8);
    to_encode[7] = (uint8_t) (serial&0x000000FF);
    crc = crc_kermit(to_encode,sizeof(to_encode)-2);
-   //printf("crc:%x\n",crc);
    to_encode[sizeof(to_encode)-2]=(uint8_t)((crc&0xFF00)>>8);
    to_encode[sizeof(to_encode)-1]=(uint8_t)(crc&0x00FF);
-   //show_in_hex_one_line(to_encode,sizeof(to_encode));
    memcpy(outputBuffer,synch_pattern,sizeof(synch_pattern));
    TS_len_u8=encode2serial_1_3(to_encode,sizeof(to_encode),&outputBuffer[sizeof(synch_pattern)]);
    return TS_len_u8+sizeof(synch_pattern);
