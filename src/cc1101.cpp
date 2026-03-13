@@ -2,13 +2,14 @@
 /*  it is exposed just to demonstrate CC1101 capability to reader water meter indexes */
 /*  there is no Warranty on radian_trx SW */
 
-#include "private.h"          // Passwords etc. - copy from Example_Private.h
+#include "private.h"          // Secrets + GDO0, METER_*, FREQUENCY - copy from Example_Private.h
+#include "config.h"           // SPI pins (non-secret hardware config)
 #include "everblu_meters.h"
 #include "utils.h"
 #include "cc1101.h"
 #include "radian_constants.h"
-#include <Arduino.h>        // Include the Arduino library for basic functions
-#include <SPI.h>            // Include the SPI library for SPI communication
+#include <Arduino.h>
+#include <SPI.h>
 
 uint8_t RF_config_u8 = 0xFF;
 uint8_t PA[] = { 0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x00, };
@@ -82,22 +83,6 @@ uint8_t debug_out = 0;
 #define TEST2 				0x2C                                    // Various test settings
 #define TEST1 				0x2D                                    // Various test settings
 #define TEST0 				0x2E                                    // Various test settings
-
-// Change these define according to your ESP8266 board
-#ifdef ESP8266
-#define SPI_CSK  PIN_SPI_SCK
-#define SPI_MISO PIN_SPI_MISO
-#define SPI_MOSI PIN_SPI_MOSI
-#define SPI_SS   PIN_SPI_SS
-#endif
-
-// Change these define according to your ESP32 board
-#ifdef ESP32
-#define SPI_CSK  SCK
-#define SPI_MISO MISO
-#define SPI_MOSI MOSI
-#define SPI_SS   SS
-#endif
 
 int _spi_speed = 0;
 int wiringPiSPIDataRW(int channel, unsigned char *data, int len)
