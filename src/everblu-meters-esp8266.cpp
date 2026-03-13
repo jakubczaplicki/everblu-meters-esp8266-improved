@@ -131,6 +131,15 @@ int calculateLQIToPercentage(int lqi) {
   return map(strength, 0, 255, 0, 100);  // Map LQI to percentage
 }
 
+// Helper: let MQTT client send queued messages and feed watchdog (avoids restart from buffer overload)
+static void mqttFlush(unsigned int ms) {
+  for (unsigned int t = 0; t < ms; t += 10) {
+    mqtt.loop();
+    yield();
+    ESP.wdtFeed();
+    delay(10);
+  }
+}
 
 // Function: onUpdateData
 // Description: Fetches data from the water meter and publishes it to MQTT topics.
@@ -249,71 +258,46 @@ void onUpdateData()
   Serial.printf("Signal quality (LQI) : %d\n", meter_data.lqi);
   Serial.printf("Signal quality (LQI percentage) : %d\n", calculateLQIToPercentage(meter_data.lqi));
 
-  // Publish meter data to MQTT
-  mqtt.publish("everblu/cyble/liters", String(meter_data.liters, DEC), true);
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/counter", String(meter_data.reads_counter, DEC), true);
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/battery", String(meter_data.battery_left, DEC), true);
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/rssi_dbm", String(meter_data.rssi_dbm, DEC), true);
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/rssi_percentage", String(calculateMeterdBmToPercentage(meter_data.rssi_dbm), DEC), true);
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/lqi", String(meter_data.lqi, DEC), true); // Publish LQI
-  yield(); ESP.wdtFeed();
+  // Publish meter data to MQTT (static buffer avoids heap fragmentation / restart)
+  static char buf[24];
+  snprintf(buf, sizeof(buf), "%d", meter_data.liters);
+  mqtt.publish("everblu/cyble/liters", buf, true);
+  snprintf(buf, sizeof(buf), "%d", meter_data.reads_counter);
+  mqtt.publish("everblu/cyble/counter", buf, true);
+  snprintf(buf, sizeof(buf), "%d", meter_data.battery_left);
+  mqtt.publish("everblu/cyble/battery", buf, true);
+  mqttFlush(40);
+
+  snprintf(buf, sizeof(buf), "%d", meter_data.rssi_dbm);
+  mqtt.publish("everblu/cyble/rssi_dbm", buf, true);
+  snprintf(buf, sizeof(buf), "%d", calculateMeterdBmToPercentage(meter_data.rssi_dbm));
+  mqtt.publish("everblu/cyble/rssi_percentage", buf, true);
+  snprintf(buf, sizeof(buf), "%d", meter_data.lqi);
+  mqtt.publish("everblu/cyble/lqi", buf, true);
   mqtt.publish("everblu/cyble/time_start", timeStartFormatted, true);
-  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/time_end", timeEndFormatted, true);
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/timestamp", iso8601, true); // timestamp since epoch in UTC
-  yield(); ESP.wdtFeed();
-  mqtt.publish("everblu/cyble/lqi_percentage", String(calculateLQIToPercentage(meter_data.lqi), DEC), true);   // Publish LQI percentage to MQTT
-  yield(); ESP.wdtFeed();
-  
-  // Publish successful frequency information if frequency scanning was used
-  if (meter_data.successful_frequency > 0.0f) {
-    Serial.printf("📡 Publishing successful frequency: %.6f MHz to MQTT\n", meter_data.successful_frequency);
-    
-    // Add memory check before publishing
-    uint32_t freeHeap = ESP.getFreeHeap();
-    Serial.printf("💾 Free heap before frequency publish: %d bytes\n", freeHeap);
-    
-    if (freeHeap > 5000) { // Ensure sufficient memory
-      mqtt.publish("everblu/cyble/successful_frequency", String(meter_data.successful_frequency, 6), true);
-      yield(); ESP.wdtFeed();
-      delay(100); // Brief delay to prevent MQTT overload
-      Serial.printf("✅ Successfully published frequency to MQTT\n");
-    } else {
-      Serial.printf("⚠️ Skipping frequency publish - insufficient memory (%d bytes)\n", freeHeap);
-    }
+  mqtt.publish("everblu/cyble/timestamp", iso8601, true);
+  snprintf(buf, sizeof(buf), "%d", calculateLQIToPercentage(meter_data.lqi));
+  mqtt.publish("everblu/cyble/lqi_percentage", buf, true);
+  mqttFlush(40);
+
+  if (meter_data.successful_frequency > 0.0f && ESP.getFreeHeap() > 5000) {
+    snprintf(buf, sizeof(buf), "%.6f", (double)meter_data.successful_frequency);
+    mqtt.publish("everblu/cyble/successful_frequency", buf, true);
+    mqttFlush(30);
   }
 
-  // Publish all data as a JSON message as well this is redundant but may be useful for some
-  // Use static buffer to prevent stack overflow
-  static char json[512];
-  memset(json, 0, sizeof(json)); // Clear buffer
-  sprintf(json, jsonTemplate, meter_data.liters, meter_data.reads_counter, meter_data.battery_left, meter_data.rssi, iso8601);
-  
-  Serial.println("Publishing JSON data to MQTT...");
-  
-  // Critical: Check memory before final large JSON publish  
-  uint32_t finalHeap = ESP.getFreeHeap();
-  Serial.printf("💾 Free heap before JSON publish: %d bytes\n", finalHeap);
-  
-  if (finalHeap > 3000) { // Ensure sufficient memory for JSON
-    yield(); ESP.wdtFeed();
+  // Optional: single JSON payload (skip if low memory to avoid crash)
+  if (ESP.getFreeHeap() > 3000) {
+    static char json[256];
+    snprintf(json, sizeof(json), jsonTemplate, meter_data.liters, meter_data.reads_counter, meter_data.battery_left, meter_data.rssi, iso8601);
     mqtt.publish("everblu/cyble/json", json, true);
-    Serial.println("✅ JSON data published successfully");
-  } else {
-    Serial.printf("⚠️ Skipping JSON publish - insufficient memory (%d bytes)\n", finalHeap);
   }
-  
-  Serial.println("Finalizing MQTT operations...");
-  yield(); ESP.wdtFeed();
-  delay(200); // Extended delay to prevent system overload
 
-  // Note: active_reading "false" already published at line 190 - no need to duplicate
+  mqtt.publish("everblu/cyble/status", "online", true);
+  mqttFlush(120);  // Let queue drain and feed watchdog before returning
+
+  // Note: active_reading "false" already published at line 207 - no need to duplicate
   
   // Reset retry flags on successful read
   _retry = 0;

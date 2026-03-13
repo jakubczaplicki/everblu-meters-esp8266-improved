@@ -7,10 +7,9 @@
  #include "everblu_meters.h"
  #include <private.h> // Passwords etc. not for GitHub
  
- void show_in_hex(uint8_t* buffer, size_t len)
- {
-   int i=0;
-	 for (i=0 ; i<len ; i++) {
+void show_in_hex(uint8_t* buffer, size_t len)
+{
+	 for (size_t i = 0; i < len; i++) {
 		 if (!(i % 16))
 			 puts("");
  
@@ -19,28 +18,25 @@
 	 printf("\n");
  }
  
- void show_in_hex_array(uint8_t* buffer, size_t len)
- {
-   int i=0;
-	 for (i=0 ; i<len ; i++) {
+void show_in_hex_array(uint8_t* buffer, size_t len)
+{
+	 for (size_t i = 0; i < len; i++) {
 	 if (!(i % 16) && i > 0) Serial.println(""); // printf("\n");
 	 Serial.printf("0x%02X, ", buffer[i]);
 	 }
    Serial.println("");
  }
  
- void show_in_hex_one_line(uint8_t* buffer, size_t len)
- {
-   int i=0;
-	 for (i=0 ; i<len ; i++) {
+void show_in_hex_one_line(uint8_t* buffer, size_t len)
+{
+	 for (size_t i = 0; i < len; i++) {
 	 Serial.printf("%02X ", buffer[i]);
 	 }
  }
  
- void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
- {
-   int i=0;
-	 for (i=0 ; i<len ; i++) {
+void show_in_hex_one_line_GET(uint8_t* buffer, size_t len)
+{
+	 for (size_t i = 0; i < len; i++) {
 	 Serial.printf("%02XS", buffer[i]);
 	 }
  }
@@ -60,7 +56,7 @@
 	 printf("\n");
  }
  
- void echo_debug(T_BOOL l_flag,char *fmt, ...)
+ void echo_debug(T_BOOL l_flag, const char *fmt, ...)
  {
   if (l_flag)
   {
@@ -185,13 +181,13 @@
   * @param outputBufferLen Number of bytes of encoded data.
   */
  int encode2serial_1_3(uint8_t *inputBuffer, int inputBufferLen, uint8_t *outputBuffer) {
- 
+
 	 // Adds a start and stop bit and reverses the bit order.
 	 // 76543210 76543210 76543210 76543210
 	 // is encoded to:
 	 // #0123456 7###0123 4567###0 1234567# ##012345 6s7# (# -> Start/Stop bit)
- 
-	 int bytepos;
+
+	 int bytepos = 0;
 	 int bitpos;
 	 int i;
 	 int j = 0;

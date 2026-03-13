@@ -454,9 +454,8 @@ void show_cc1101_registers_settings(void)
 
 uint8_t is_look_like_radian_frame(uint8_t* buffer, size_t len)
 {
-  int i, ret;
-  ret = FALSE;
-  for (i = 0; i < len; i++) {
+  uint8_t ret = FALSE;
+  for (size_t i = 0; i < len; i++) {
     if (buffer[i] == 0xFF) ret = TRUE;
   }
 

@@ -185,6 +185,16 @@ Your transceiver module may not be calibrated correctly. Adjust the frequency sl
 > [!NOTE]
 > This is particularly relevant in the UK.
 
+### No data showing in Home Assistant (ESP publishes successfully)
+
+If the serial console shows successful meter reads and "JSON data published successfully" but entities in Home Assistant are missing or show "unavailable":
+
+1. **Same MQTT broker** — Home Assistant must use the **same** broker as the ESP (e.g. `192.168.1.45`). Check **Settings → Devices & services → MQTT** and confirm the broker host/port matches `private.h`.
+2. **MQTT integration** — Ensure the MQTT integration is added and connected. Discovery is enabled by default.
+3. **Look for the device** — Go to **Settings → Devices & services → MQTT → [your broker] → Devices** (or **Entities**) and find the "Water Meter" device. Entities may be in a different area or disabled.
+4. **Availability topic** — Entities use `everblu/cyble/status` as availability. The ESP publishes `online` when connected and after a successful read; if the broker still has a retained `offline` (e.g. from a previous session), power-cycle the ESP and wait for "Setup done" so it publishes `online` again.
+5. **Update frequency after scan** — If you ran frequency discovery, set `SCAN_FREQUENCY_433MHZ` back to `0` and update `FREQUENCY` in `private.h` to the recommended value (e.g. `433.821899`) so future reads use the correct frequency.
+
 ### Serial Number Starting with 0
 
 Ignore the leading 0 and provide the serial number in the configuration without it.
