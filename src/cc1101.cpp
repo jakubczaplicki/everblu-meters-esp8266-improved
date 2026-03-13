@@ -87,6 +87,7 @@ uint8_t debug_out = 0;
 int _spi_speed = 0;
 int wiringPiSPIDataRW(int channel, unsigned char *data, int len)
 {
+  (void)channel;
   if (!_spi_speed) return -1;
 
   SPI.beginTransaction(SPISettings(_spi_speed, MSBFIRST, SPI_MODE0));
@@ -104,6 +105,7 @@ int wiringPiSPIDataRW(int channel, unsigned char *data, int len)
 
 int wiringPiSPISetup(int channel, int speed)
 {
+  (void)channel;
   _spi_speed = speed;
 
   pinMode(SPI_SS, OUTPUT);
@@ -245,9 +247,9 @@ void cc1101_reset(void)
 }
 
 void setMHZ(float mhz) {
-  byte freq2 = 0;
-  byte freq1 = 0;
-  byte freq0 = 0;
+  int freq2 = 0;
+  int freq1 = 0;
+  int freq0 = 0;
 
   for (bool i = 0; i == 0;) {
     if (mhz >= 26) {
@@ -265,9 +267,9 @@ void setMHZ(float mhz) {
     else { i = 1; }
   }
   if (freq0 > 255) { freq1 += 1; freq0 -= 256; }
-  halRfWriteReg(FREQ2, freq2);
-  halRfWriteReg(FREQ1, freq1);
-  halRfWriteReg(FREQ0, freq0);
+  halRfWriteReg(FREQ2, (uint8_t)freq2);
+  halRfWriteReg(FREQ1, (uint8_t)freq1);
+  halRfWriteReg(FREQ0, (uint8_t)freq0);
 }
 
 void cc1101_configureRF_0(float freq)
@@ -568,26 +570,21 @@ int receive_radian_frame(int size_byte, int rx_tmo_ms, uint8_t*rxBuffer, int rxB
 
   Serial.printf("Waiting for GDO0 signal (phase 1, timeout: %dms)...\n", rx_tmo_ms);
   
-  // Enhanced GDO0 validation loop
-  
-  while ((digitalRead(GDO0) == FALSE) && (l_tmo < rx_tmo_ms)) { 
+  while ((digitalRead(GDO0) != GDO0_SIGNAL_LEVEL) && (l_tmo < rx_tmo_ms)) {
     delay(1); l_tmo++;
-    if (l_tmo % 50 == 0) ESP.wdtFeed(); // Feed watchdog every 50ms
+    if (l_tmo % 50 == 0) ESP.wdtFeed();
   }
   
   if (l_tmo < rx_tmo_ms) {
     echo_debug(debug_out, "GDO0! (0, %d) ", l_tmo);
     Serial.printf("GDO0 signal detected after %dms\n", l_tmo);
     
-    // Enhanced validation for real vs false signals
     if (l_tmo <= 2) {
       Serial.println("WARNING: Very fast GDO0 trigger detected - validating signal quality...");
-      
-      // Check if signal remains stable for a few milliseconds
       bool signal_stable = true;
       for (int i = 0; i < 5; i++) {
         delay(2);
-        if (digitalRead(GDO0) == FALSE) {
+        if (digitalRead(GDO0) != GDO0_SIGNAL_LEVEL) {
           signal_stable = false;
           break;
         }
@@ -634,9 +631,9 @@ int receive_radian_frame(int size_byte, int rx_tmo_ms, uint8_t*rxBuffer, int rxB
   l_total_byte = 0;
   l_byte_in_rx = 1;
   Serial.printf("Waiting for GDO0 signal (phase 2, remaining timeout: %dms)...\n", rx_tmo_ms - l_tmo);
-  while ((digitalRead(GDO0) == FALSE) && (l_tmo < rx_tmo_ms)) { 
+  while ((digitalRead(GDO0) != GDO0_SIGNAL_LEVEL) && (l_tmo < rx_tmo_ms)) {
     delay(1); l_tmo++;
-    if (l_tmo % 50 == 0) ESP.wdtFeed(); // Feed watchdog every 50ms
+    if (l_tmo % 50 == 0) ESP.wdtFeed();
   }
   if (l_tmo < rx_tmo_ms) {
     echo_debug(debug_out, "GDO0! (1, %d) ", l_tmo);
@@ -874,7 +871,8 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
                 (freq_count * 20) / 60, (freq_count * 45) / 60);
   
   // Try each frequency with comprehensive testing
-  struct tmeter_data best_candidate = {0}; // Track best signal quality even if no data
+  struct tmeter_data best_candidate;
+  memset(&best_candidate, 0, sizeof(best_candidate));
   float best_candidate_freq = 0.0f;
   int8_t best_candidate_rssi = -127; // Minimum valid int8_t value for RSSI
   
@@ -904,7 +902,7 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
     for (int j = 0; j < 5; j++) {
       uint8_t rssi_raw = halRfReadReg(RSSI_ADDR);
       int8_t rssi_dbm = cc1100_rssi_convert2dbm(rssi_raw);
-      if (rssi_dbm > -130 && rssi_dbm < 10) { // Valid range
+      if ((int)rssi_dbm > -130 && (int)rssi_dbm < 10) { // Valid range (cast for comparison)
         rssi_sum += rssi_dbm;
         valid_readings++;
         Serial.printf("%d ", rssi_dbm);
@@ -950,7 +948,8 @@ struct tmeter_data get_meter_data_with_frequency_scan(void)
       Serial.println("🔄 Fair signal detected - attempting additional communication try");
     }
     
-    struct tmeter_data best_attempt = {0};
+    struct tmeter_data best_attempt;
+    memset(&best_attempt, 0, sizeof(best_attempt));
     bool got_data = false;
     
     for (int attempt = 1; attempt <= communication_attempts; attempt++) {
