@@ -10,10 +10,12 @@ struct tmeter_data {
   int rssi; // Radio signal strength indicator
   int rssi_dbm; // RSSI in dBm
   int lqi; // Link quality indicator 0-255
+  float successful_frequency; // The frequency that worked for this reading
 };
 
 void setMHZ(float mhz);
-void  cc1101_init(float freq);
+bool cc1101_init(float freq);
 struct tmeter_data get_meter_data(void);
+struct tmeter_data get_meter_data_with_frequency_scan(void);
 
 #endif // __CC1101_H__

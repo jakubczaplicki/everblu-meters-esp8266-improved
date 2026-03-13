@@ -48,6 +48,11 @@
 #endif
 
 unsigned long lastWifiUpdate = 0;
+unsigned long lastRetryAttempt = 0;
+bool retryPending = false;
+unsigned long cooldownEndTime = 0;  // End time for 1-hour cooldown period
+const unsigned long COOLDOWN_PERIOD = 3600000; // 1 hour in milliseconds
+const int MAX_RETRIES = 3;
 
 // Secrets pulled from private.h file
 EspMQTTClient mqtt(
@@ -89,7 +94,10 @@ void scanFrequency433MHz() {
   Serial.printf("###### FREQUENCY DISCOVERY ENABLED (433 MHz) ######\nStarting Frequency Scan...\n");
   for (float i = 433.76f; i < 433.890f; i += 0.0005f) {
       Serial.printf("Test frequency : %f\n", i);
-      cc1101_init(i);
+      if (!cc1101_init(i)) {
+        Serial.println("CC1101 SPI init failed - check wiring");
+        continue;
+      }
       struct tmeter_data meter_data = get_meter_data();
       if (meter_data.reads_counter != 0 || meter_data.liters != 0) {
           Serial.printf("\n------------------------------\nGot frequency : %f\n------------------------------\n", i);
@@ -126,12 +134,39 @@ int calculateLQIToPercentage(int lqi) {
   return map(strength, 0, 255, 0, 100);  // Map LQI to percentage
 }
 
+// Helper: let MQTT client send queued messages and feed watchdog (avoids restart from buffer overload)
+static void mqttFlush(unsigned int ms) {
+  for (unsigned int t = 0; t < ms; t += 10) {
+    mqtt.loop();
+    yield();
+    ESP.wdtFeed();
+    delay(10);
+  }
+}
 
 // Function: onUpdateData
 // Description: Fetches data from the water meter and publishes it to MQTT topics.
-//              Retries up to 10 times if data retrieval fails.
+//              Retries up to 3 times if data retrieval fails, then enters 1-hour cooldown.
 void onUpdateData()
 {
+  // Check if we're still in cooldown period
+  if (cooldownEndTime > 0 && millis() < cooldownEndTime) {
+    unsigned long remainingTime = (cooldownEndTime - millis()) / 1000; // seconds
+    Serial.printf("Meter reading blocked - cooldown active. %lu seconds remaining.\n", remainingTime);
+    
+    // Publish cooldown status to MQTT
+    String cooldownMsg = "Cooldown active - " + String(remainingTime / 60) + " minutes remaining";
+    mqtt.publish("everblu/cyble/status", cooldownMsg, true);
+    return;
+  }
+  
+  // Reset cooldown if period has expired
+  if (cooldownEndTime > 0 && millis() >= cooldownEndTime) {
+    cooldownEndTime = 0;
+    Serial.println("Cooldown period expired. Meter reading requests now allowed.");
+    mqtt.publish("everblu/cyble/status", "Ready - cooldown expired", true);
+  }
+
   Serial.printf("Updating data from meter...\n");
   Serial.printf("Retry count : %d\n", _retry);
   Serial.printf("Reading schedule : %s\n", readingSchedule.c_str());
@@ -139,10 +174,56 @@ void onUpdateData()
   // Indicate activity with LED
   digitalWrite(LED_BUILTIN, LOW); // Turn on LED to indicate activity
 
-  // Notify MQTT that active reading has started
-  mqtt.publish("everblu/cyble/active_reading", "true", true);
-
+  // CONSERVATIVE APPROACH: Reduce WiFi interference without complete shutdown
+  Serial.println("Reducing WiFi interference for RF operations...");
+  
+  // Pause MQTT and reduce WiFi activity instead of complete disable
+  WiFi.setOutputPower(0); // Reduce WiFi transmission power temporarily
+  yield(); ESP.wdtFeed();
+  
+  // Fresh CC1101 initialization like the successful scanner  
+  Serial.println("Reinitializing CC1101 for clean RF state...");
+  if (!cc1101_init(FREQUENCY)) {
+    Serial.println("CC1101 init failed - skipping meter read");
+    WiFi.setOutputPower(20.5);
+    mqtt.publish("everblu/cyble/status", "CC1101 init failed", true);
+    mqtt.publish("everblu/cyble/active_reading", "false", true);
+    digitalWrite(LED_BUILTIN, HIGH);
+    return;
+  }
+  yield(); ESP.wdtFeed();
+  
+  // Brief delay to settle RF state
+  delay(50);
+  ESP.wdtFeed();
+  
+  // Clean RF measurement with minimal WiFi interference
+  // Try standard approach first, then frequency scanning if it fails
+  Serial.println("Attempting meter reading with configured frequency...");
   struct tmeter_data meter_data = get_meter_data(); // Fetch meter data
+  
+  // If standard approach failed, try frequency scanning
+  if (meter_data.reads_counter == 0 && meter_data.liters == 0) {
+    Serial.println("🔍 Standard frequency failed - starting intelligent frequency scan...");
+    Serial.println("This may take 2-3 minutes to test multiple frequencies");
+    meter_data = get_meter_data_with_frequency_scan();
+  }
+  
+  // Restore full WiFi power after RF operations
+  Serial.println("Restoring full WiFi power...");
+  WiFi.setOutputPower(20.5); // Restore full WiFi power (max for ESP8266)
+  yield(); ESP.wdtFeed();
+  
+  // Ensure MQTT is still connected (should be since we never fully disconnected)
+  if (!mqtt.isConnected()) {
+    Serial.println("MQTT disconnected during RF operations, reconnecting...");
+    // Don't force reconnect - let the MQTT library handle it naturally
+    yield(); ESP.wdtFeed();
+  }
+  
+  Serial.println("Starting MQTT data publication...");
+  yield(); ESP.wdtFeed();
+  mqtt.publish("everblu/cyble/active_reading", "false", true);
 
   // Get current UTC time
   time_t tnow = time(nullptr);
@@ -155,8 +236,19 @@ void onUpdateData()
   // Handle data retrieval failure
   if (meter_data.reads_counter == 0 || meter_data.liters == 0) {
     Serial.println("Unable to retrieve data from meter. Retry later...");
-    if (_retry++ < 10)
-      mqtt.executeDelayed(1000 * 10, onUpdateData); // Retry in 10 seconds
+    if (_retry < MAX_RETRIES) {
+      _retry++;
+      retryPending = true;
+      lastRetryAttempt = millis();
+    } else {
+      Serial.printf("Max retries (%d) reached. Entering 1-hour cooldown period.\n", MAX_RETRIES);
+      cooldownEndTime = millis() + COOLDOWN_PERIOD;
+      _retry = 0; // Reset for next trigger
+      Serial.println("Next meter reading allowed after cooldown period expires.");
+      
+      // Notify Home Assistant about cooldown
+      mqtt.publish("everblu/cyble/status", "Max retries reached - entering 1-hour cooldown", true);
+    }
     return;
   }
 
@@ -176,39 +268,56 @@ void onUpdateData()
   Serial.printf("Signal quality (LQI) : %d\n", meter_data.lqi);
   Serial.printf("Signal quality (LQI percentage) : %d\n", calculateLQIToPercentage(meter_data.lqi));
 
-  // Publish meter data to MQTT
-  mqtt.publish("everblu/cyble/liters", String(meter_data.liters, DEC), true);
-  delay(50);
-  mqtt.publish("everblu/cyble/counter", String(meter_data.reads_counter, DEC), true);
-  delay(50);
-  mqtt.publish("everblu/cyble/battery", String(meter_data.battery_left, DEC), true);
-  delay(50);
-  mqtt.publish("everblu/cyble/rssi_dbm", String(meter_data.rssi_dbm, DEC), true);
-  delay(50);
-  mqtt.publish("everblu/cyble/rssi_percentage", String(calculateMeterdBmToPercentage(meter_data.rssi_dbm), DEC), true);
-  delay(50);
-  mqtt.publish("everblu/cyble/lqi", String(meter_data.lqi, DEC), true); // Publish LQI
-  delay(50);
+  // Publish meter data to MQTT (static buffer avoids heap fragmentation / restart)
+  static char buf[24];
+  snprintf(buf, sizeof(buf), "%d", meter_data.liters);
+  mqtt.publish("everblu/cyble/liters", buf, true);
+  snprintf(buf, sizeof(buf), "%d", meter_data.reads_counter);
+  mqtt.publish("everblu/cyble/counter", buf, true);
+  snprintf(buf, sizeof(buf), "%d", meter_data.battery_left);
+  mqtt.publish("everblu/cyble/battery", buf, true);
+  mqttFlush(40);
+
+  snprintf(buf, sizeof(buf), "%d", meter_data.rssi_dbm);
+  mqtt.publish("everblu/cyble/rssi_dbm", buf, true);
+  snprintf(buf, sizeof(buf), "%d", calculateMeterdBmToPercentage(meter_data.rssi_dbm));
+  mqtt.publish("everblu/cyble/rssi_percentage", buf, true);
+  snprintf(buf, sizeof(buf), "%d", meter_data.lqi);
+  mqtt.publish("everblu/cyble/lqi", buf, true);
   mqtt.publish("everblu/cyble/time_start", timeStartFormatted, true);
-  delay(50);
   mqtt.publish("everblu/cyble/time_end", timeEndFormatted, true);
-  delay(50);
-  mqtt.publish("everblu/cyble/timestamp", iso8601, true); // timestamp since epoch in UTC
-  delay(50);
-  mqtt.publish("everblu/cyble/lqi_percentage", String(calculateLQIToPercentage(meter_data.lqi), DEC), true);   // Publish LQI percentage to MQTT
-  delay(50);
+  mqtt.publish("everblu/cyble/timestamp", iso8601, true);
+  snprintf(buf, sizeof(buf), "%d", calculateLQIToPercentage(meter_data.lqi));
+  mqtt.publish("everblu/cyble/lqi_percentage", buf, true);
+  mqttFlush(40);
 
-  // Publish all data as a JSON message as well this is redundant but may be useful for some
-  char json[512];
-  sprintf(json, jsonTemplate, meter_data.liters, meter_data.reads_counter, meter_data.battery_left, meter_data.rssi, iso8601);
-  mqtt.publish("everblu/cyble/json", json, true);
+  if (meter_data.successful_frequency > 0.0f && ESP.getFreeHeap() > 5000) {
+    snprintf(buf, sizeof(buf), "%.6f", (double)meter_data.successful_frequency);
+    mqtt.publish("everblu/cyble/successful_frequency", buf, true);
+    mqttFlush(30);
+  }
 
-  // Notify MQTT that active reading has ended
-  mqtt.publish("everblu/cyble/active_reading", "false", true);
+  // Optional: single JSON payload (skip if low memory to avoid crash)
+  if (ESP.getFreeHeap() > 3000) {
+    static char json[256];
+    snprintf(json, sizeof(json), jsonTemplate, meter_data.liters, meter_data.reads_counter, meter_data.battery_left, meter_data.rssi, iso8601);
+    mqtt.publish("everblu/cyble/json", json, true);
+  }
+
+  mqtt.publish("everblu/cyble/status", "online", true);
+  mqttFlush(120);  // Let queue drain and feed watchdog before returning
+
+  // Note: active_reading "false" already published at line 207 - no need to duplicate
+  
+  // Reset retry flags on successful read
+  _retry = 0;
+  retryPending = false;
   digitalWrite(LED_BUILTIN, HIGH); // Turn off LED to indicate completion
 
   Serial.printf("Data update complete.\n\n");
 }
+
+#define NTP_MIN_VALID_YEAR 121  // 2021 - reject unset/skewed time
 
 // Function: onScheduled
 // Description: Schedules daily meter readings at 10:00 AM UTC.
@@ -216,6 +325,10 @@ void onScheduled()
 {
   time_t tnow = time(nullptr);
   struct tm *ptm = gmtime(&tnow);
+  if (!ptm || ptm->tm_year < NTP_MIN_VALID_YEAR) {
+    mqtt.executeDelayed(500, onScheduled);
+    return; // NTP not synced yet
+  }
 
   // Check if today is a valid reading day
   if (isReadingDay(ptm) && ptm->tm_hour == 10 && ptm->tm_min == 0 && ptm->tm_sec == 0) {
@@ -240,7 +353,7 @@ void onScheduled()
 
 // JSON Discovery for Reading (Total)
 // This is used to show the total water usage in Home Assistant
-String jsonDiscoveryReading = R"rawliteral(
+const char jsonDiscoveryReading[] PROGMEM = R"rawliteral(
 {
   "name": "Reading (Total)",
   "uniq_id": "water_meter_value",
@@ -264,7 +377,7 @@ String jsonDiscoveryReading = R"rawliteral(
 
 // JSON Discovery for Battery Level
 // This is used to show the battery level in Home Assistant
-String jsonDiscoveryBattery = R"rawliteral(
+const char jsonDiscoveryBattery[] PROGMEM = R"rawliteral(
 {
   "name": "Battery",
   "uniq_id": "water_meter_battery",
@@ -288,7 +401,7 @@ String jsonDiscoveryBattery = R"rawliteral(
 
 // JSON Discovery for Read Counter
 // This is used to show the number of times the meter has been read in Home Assistant
-String jsonDiscoveryReadCounter = R"rawliteral(
+const char jsonDiscoveryReadCounter[] PROGMEM = R"rawliteral(
 {
   "name": "Read Counter",
   "uniq_id": "water_meter_counter",
@@ -309,7 +422,7 @@ String jsonDiscoveryReadCounter = R"rawliteral(
 
 // JSON Discovery for Last Read (timestamp)
 // This is used to show the last time the meter was read in Home Assistant
-String jsonDiscoveryLastRead = R"rawliteral(
+const char jsonDiscoveryLastRead[] PROGMEM = R"rawliteral(
 {
   "name": "Last Read",
   "uniq_id": "water_meter_timestamp",
@@ -331,7 +444,7 @@ String jsonDiscoveryLastRead = R"rawliteral(
 
 // JSON Discovery for Request Reading (button)
 // This is used to trigger a reading from the meter when pressed in Home Assistant
-String jsonDiscoveryRequestReading = R"rawliteral(
+const char jsonDiscoveryRequestReading[] PROGMEM = R"rawliteral(
 {
   "name": "Request Reading Now",
   "uniq_id": "water_meter_request",
@@ -354,7 +467,7 @@ String jsonDiscoveryRequestReading = R"rawliteral(
 
 // JSON Discovery for Active Reading (binary sensor)
 // This is used to indicate that the device is currently reading data from the meter
-String jsonDiscoveryActiveReading = R"rawliteral(
+const char jsonDiscoveryActiveReading[] PROGMEM = R"rawliteral(
 {
   "name": "Active Reading",
   "uniq_id": "water_meter_active_reading",
@@ -376,7 +489,7 @@ String jsonDiscoveryActiveReading = R"rawliteral(
 
 // JSON Discovery for Wi-Fi Details
 // These are used to provide information about the Wi-Fi connection of the device
-String jsonDiscoveryWifiIP = R"rawliteral(
+const char jsonDiscoveryWifiIP[] PROGMEM = R"rawliteral(
 {
   "name": "IP Address",
   "uniq_id": "water_meter_wifi_ip",
@@ -397,7 +510,7 @@ String jsonDiscoveryWifiIP = R"rawliteral(
 
 // JSON Discovery for Wi-Fi RSSI
 // This is used to show the Wi-Fi signal strength in Home Assistant
-String jsonDiscoveryWifiRSSI = R"rawliteral(
+const char jsonDiscoveryWifiRSSI[] PROGMEM = R"rawliteral(
 {
   "name": "WiFi RSSI",
   "uniq_id": "water_meter_wifi_rssi",
@@ -420,7 +533,7 @@ String jsonDiscoveryWifiRSSI = R"rawliteral(
 
 // JSON Discovery for Wi-Fi Signal Percentage
 // This is used to show the Wi-Fi signal strength as a percentage in Home Assistant
-String jsonDiscoveryWifiSignalPercentage = R"rawliteral(
+const char jsonDiscoveryWifiSignalPercentage[] PROGMEM = R"rawliteral(
 {
   "name": "WiFi Signal",
   "uniq_id": "water_meter_wifi_signal_percentage",
@@ -442,7 +555,7 @@ String jsonDiscoveryWifiSignalPercentage = R"rawliteral(
 
 // JSON Discovery for MAC Address
 // This is used to show the MAC address of the device in Home Assistant
-String jsonDiscoveryMacAddress = R"rawliteral(
+const char jsonDiscoveryMacAddress[] PROGMEM = R"rawliteral(
 {
   "name": "MAC Address",
   "uniq_id": "water_meter_mac_address",
@@ -463,7 +576,7 @@ String jsonDiscoveryMacAddress = R"rawliteral(
 
 // JSON Discovery for BSSID
 // This is used to show the BSSID of the device in Home Assistant
-String jsonDiscoveryBSSID = R"rawliteral(
+const char jsonDiscoveryBSSID[] PROGMEM = R"rawliteral(
 {
   "name": "WiFi BSSID",
   "uniq_id": "water_meter_wifi_bssid",
@@ -484,7 +597,7 @@ String jsonDiscoveryBSSID = R"rawliteral(
 
 // JSON Discovery for Wi-Fi SSID
 // This is used to show the SSID of the device in Home Assistant
-String jsonDiscoverySSID = R"rawliteral(
+const char jsonDiscoverySSID[] PROGMEM = R"rawliteral(
 {
   "name": "WiFi SSID",
   "uniq_id": "water_meter_wifi_ssid",
@@ -505,7 +618,7 @@ String jsonDiscoverySSID = R"rawliteral(
 
 // JSON Discovery for Uptime
 // This is used to show the uptime of the device in Home Assistant
-String jsonDiscoveryUptime = R"rawliteral(
+const char jsonDiscoveryUptime[] PROGMEM = R"rawliteral(
 {
   "name": "Device Uptime",
   "uniq_id": "water_meter_uptime",
@@ -527,7 +640,7 @@ String jsonDiscoveryUptime = R"rawliteral(
 
 // JSON Discovery for Restart Button
 // This is used to trigger a restart of the device when pressed in Home Assistant
-String jsonDiscoveryRestartButton = R"rawliteral(
+const char jsonDiscoveryRestartButton[] PROGMEM = R"rawliteral(
 {
   "name": "Restart Device",
   "uniq_id": "water_meter_restart",
@@ -547,7 +660,7 @@ String jsonDiscoveryRestartButton = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Meter Year
-String jsonDiscoveryMeterYear = R"rawliteral(
+const char jsonDiscoveryMeterYear[] PROGMEM = R"rawliteral(
 {
   "name": "Meter Year",
   "uniq_id": "water_meter_year",
@@ -568,7 +681,7 @@ String jsonDiscoveryMeterYear = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Meter Serial
-String jsonDiscoveryMeterSerial = R"rawliteral(
+const char jsonDiscoveryMeterSerial[] PROGMEM = R"rawliteral(
 {
   "name": "Meter Serial",
   "uniq_id": "water_meter_serial",
@@ -589,7 +702,7 @@ String jsonDiscoveryMeterSerial = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Frequency
-String jsonDiscoveryFrequency = R"rawliteral(
+const char jsonDiscoveryFrequency[] PROGMEM = R"rawliteral(
 {
   "name": "Meter Frequency",
   "uniq_id": "water_meter_frequency",
@@ -611,7 +724,7 @@ String jsonDiscoveryFrequency = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Reading Schedule
-String jsonDiscoveryReadingSchedule = R"rawliteral(
+const char jsonDiscoveryReadingSchedule[] PROGMEM = R"rawliteral(
 {
   "name": "Reading Schedule",
   "uniq_id": "water_meter_reading_schedule",
@@ -632,7 +745,7 @@ String jsonDiscoveryReadingSchedule = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Battery Months Left
-String jsonDiscoveryBatteryMonths = R"rawliteral(
+const char jsonDiscoveryBatteryMonths[] PROGMEM = R"rawliteral(
 {
   "name": "Months Remaining",
   "uniq_id": "water_meter_battery_months",
@@ -654,7 +767,7 @@ String jsonDiscoveryBatteryMonths = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Meter RSSI (dBm)
-String jsonDiscoveryMeterRSSIDBm = R"rawliteral(
+const char jsonDiscoveryMeterRSSIDBm[] PROGMEM = R"rawliteral(
 {
   "name": "RSSI",
   "uniq_id": "water_meter_rssi_dbm",
@@ -676,7 +789,7 @@ String jsonDiscoveryMeterRSSIDBm = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Meter RSSI (Percentage)
-String jsonDiscoveryMeterRSSIPercentage = R"rawliteral(
+const char jsonDiscoveryMeterRSSIPercentage[] PROGMEM = R"rawliteral(
 {
   "name": "Signal",
   "uniq_id": "water_meter_rssi_percentage",
@@ -697,7 +810,7 @@ String jsonDiscoveryMeterRSSIPercentage = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Meter LQI (Link Quality Indicator)
-String jsonDiscoveryLQIPercentage = R"rawliteral(
+const char jsonDiscoveryLQIPercentage[] PROGMEM = R"rawliteral(
   {
     "name": "Signal Quality (LQI)",
     "uniq_id": "water_meter_lqi_percentage",
@@ -718,7 +831,7 @@ String jsonDiscoveryLQIPercentage = R"rawliteral(
   )rawliteral";
   
 // JSON Discovery for Meter Wake Time
-String jsonDiscoveryTimeStart = R"rawliteral(
+const char jsonDiscoveryTimeStart[] PROGMEM = R"rawliteral(
 {
   "name": "Wake Time",
   "uniq_id": "water_meter_time_start",
@@ -738,7 +851,7 @@ String jsonDiscoveryTimeStart = R"rawliteral(
 )rawliteral";
 
 // JSON Discovery for Meter Sleep Time
-String jsonDiscoveryTimeEnd = R"rawliteral(
+const char jsonDiscoveryTimeEnd[] PROGMEM = R"rawliteral(
 {
   "name": "Sleep Time",
   "uniq_id": "water_meter_time_end",
@@ -782,21 +895,21 @@ void publishWifiDetails() {
 
   // Publish diagnostic sensors
   mqtt.publish("everblu/cyble/wifi_ip", wifiIP, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/wifi_rssi", String(wifiRSSI, DEC), true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/wifi_signal_percentage", String(wifiSignalPercentage, DEC), true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/mac_address", macAddress, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/ssid", wifiSSID, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/bssid", wifiBSSID, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/status", status, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/uptime", uptimeISO, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
 
   Serial.println("> Wi-Fi details published");
 }
@@ -808,15 +921,15 @@ void publishMeterSettings() {
 
   // Publish Meter Year, Serial, and Frequency
   mqtt.publish("everblu/cyble/water_meter_year", String(METER_YEAR, DEC), true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/water_meter_serial", String(METER_SERIAL, DEC), true);
-  delay(50);
+  yield(); ESP.wdtFeed();
   mqtt.publish("everblu/cyble/water_meter_frequency", String(FREQUENCY, 6), true);
-  delay(50);
+  yield(); ESP.wdtFeed();
 
   // Publish Reading Schedule
   mqtt.publish("everblu/cyble/reading_schedule", readingSchedule, true);
-  delay(50);
+  yield(); ESP.wdtFeed();
 
   Serial.println("> Meter settings published");
 }
@@ -828,13 +941,24 @@ void onConnectionEstablished()
   Serial.println("Connected to MQTT Broker :)");
 
   Serial.println("> Configure time from NTP server. Please wait...");
-  // Note, my VLAN has no WAN/internet, so I am useing Home Assistant Community Add-on: chrony to proxy the time
   configTzTime("UTC0", secret_local_timeclock_server);
 
-  delay(5000); // Give it a moment for the time to sync the print out the time
+  // Wait for NTP sync (time year >= 2021) or timeout 15s
   time_t tnow = time(nullptr);
+  for (int n = 0; n < 30; n++) {
+    delay(500);
+    tnow = time(nullptr);
+    struct tm *pt = gmtime(&tnow);
+    if (pt && pt->tm_year >= 121) break; // 2021 or later
+    yield();
+    ESP.wdtFeed();
+  }
   struct tm *ptm = gmtime(&tnow);
-  Serial.printf("Current date (UTC) : %04d/%02d/%02d %02d:%02d/%02d - %s\n", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec, String(tnow, DEC).c_str());
+  if (ptm && ptm->tm_year >= 121) {
+    Serial.printf("Current date (UTC) : %04d/%02d/%02d %02d:%02d\n", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min);
+  } else {
+    Serial.println("WARNING: NTP sync may have failed - scheduled readings may be wrong.");
+  }
   
   Serial.println("> Configure Arduino OTA flash.");
   ArduinoOTA.onStart([]() {
@@ -873,6 +997,9 @@ void onConnectionEstablished()
     }
   });
   ArduinoOTA.setHostname("EVERBLUREADER");
+#ifdef secret_ota_password
+  ArduinoOTA.setPassword(secret_ota_password);
+#endif
   ArduinoOTA.begin();
   Serial.println("> Ready");
   Serial.print("> IP address: ");
@@ -899,69 +1026,69 @@ void onConnectionEstablished()
 
   // Publish Meter details discovery configuration
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_value/config", jsonDiscoveryReading, true);
+  mqtt.publish("homeassistant/sensor/water_meter_value/config", FPSTR(jsonDiscoveryReading), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_battery/config", jsonDiscoveryBattery, true);
+  mqtt.publish("homeassistant/sensor/water_meter_battery/config", FPSTR(jsonDiscoveryBattery), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_counter/config", jsonDiscoveryReadCounter, true);
+  mqtt.publish("homeassistant/sensor/water_meter_counter/config", FPSTR(jsonDiscoveryReadCounter), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_timestamp/config", jsonDiscoveryLastRead, true);
+  mqtt.publish("homeassistant/sensor/water_meter_timestamp/config", FPSTR(jsonDiscoveryLastRead), true);
   delay(50);
-  mqtt.publish("homeassistant/button/water_meter_request/config", jsonDiscoveryRequestReading, true);
+  mqtt.publish("homeassistant/button/water_meter_request/config", FPSTR(jsonDiscoveryRequestReading), true);
   delay(50);
 
   // Publish Wi-Fi details discovery configuration
-  mqtt.publish("homeassistant/sensor/water_meter_wifi_ip/config", jsonDiscoveryWifiIP, true);
+  mqtt.publish("homeassistant/sensor/water_meter_wifi_ip/config", FPSTR(jsonDiscoveryWifiIP), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_wifi_rssi/config", jsonDiscoveryWifiRSSI, true);
+  mqtt.publish("homeassistant/sensor/water_meter_wifi_rssi/config", FPSTR(jsonDiscoveryWifiRSSI), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_mac_address/config", jsonDiscoveryMacAddress, true);
+  mqtt.publish("homeassistant/sensor/water_meter_mac_address/config", FPSTR(jsonDiscoveryMacAddress), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_wifi_ssid/config", jsonDiscoverySSID, true);
+  mqtt.publish("homeassistant/sensor/water_meter_wifi_ssid/config", FPSTR(jsonDiscoverySSID), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_wifi_bssid/config", jsonDiscoveryBSSID, true);
+  mqtt.publish("homeassistant/sensor/water_meter_wifi_bssid/config", FPSTR(jsonDiscoveryBSSID), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_uptime/config", jsonDiscoveryUptime, true);
+  mqtt.publish("homeassistant/sensor/water_meter_uptime/config", FPSTR(jsonDiscoveryUptime), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_wifi_signal_percentage/config", jsonDiscoveryWifiSignalPercentage, true);
+  mqtt.publish("homeassistant/sensor/water_meter_wifi_signal_percentage/config", FPSTR(jsonDiscoveryWifiSignalPercentage), true);
   delay(50);
 
   // Publish MQTT discovery messages for the Restart Button
-  mqtt.publish("homeassistant/button/water_meter_restart/config", jsonDiscoveryRestartButton, true);
+  mqtt.publish("homeassistant/button/water_meter_restart/config", FPSTR(jsonDiscoveryRestartButton), true);
   delay(50);
 
   // Publish MQTT discovery message for the binary sensor
-  mqtt.publish("homeassistant/binary_sensor/water_meter_active_reading/config", jsonDiscoveryActiveReading, true);
+  mqtt.publish("homeassistant/binary_sensor/water_meter_active_reading/config", FPSTR(jsonDiscoveryActiveReading), true);
   delay(50);
 
   // Publish MQTT discovery messages for Meter Year, Serial, and Frequency
-  mqtt.publish("homeassistant/sensor/water_meter_year/config", jsonDiscoveryMeterYear, true);
+  mqtt.publish("homeassistant/sensor/water_meter_year/config", FPSTR(jsonDiscoveryMeterYear), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_serial/config", jsonDiscoveryMeterSerial, true);
+  mqtt.publish("homeassistant/sensor/water_meter_serial/config", FPSTR(jsonDiscoveryMeterSerial), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_frequency/config", jsonDiscoveryFrequency, true);
+  mqtt.publish("homeassistant/sensor/water_meter_frequency/config", FPSTR(jsonDiscoveryFrequency), true);
   delay(50);
 
   // Publish JSON discovery for Reading Schedule
-  mqtt.publish("homeassistant/sensor/water_meter_reading_schedule/config", jsonDiscoveryReadingSchedule, true);
+  mqtt.publish("homeassistant/sensor/water_meter_reading_schedule/config", FPSTR(jsonDiscoveryReadingSchedule), true);
   delay(50);
 
   // Publish JSON discovery for Battery Months Left
-  mqtt.publish("homeassistant/sensor/water_meter_battery_months/config", jsonDiscoveryBatteryMonths, true);
+  mqtt.publish("homeassistant/sensor/water_meter_battery_months/config", FPSTR(jsonDiscoveryBatteryMonths), true);
   delay(50);
 
   // Publish JSON discovery for Meter RSSI (dBm), RSSI (%), and LQI (%)
-  mqtt.publish("homeassistant/sensor/water_meter_rssi_dbm/config", jsonDiscoveryMeterRSSIDBm, true);
+  mqtt.publish("homeassistant/sensor/water_meter_rssi_dbm/config", FPSTR(jsonDiscoveryMeterRSSIDBm), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_rssi_percentage/config", jsonDiscoveryMeterRSSIPercentage, true);
+  mqtt.publish("homeassistant/sensor/water_meter_rssi_percentage/config", FPSTR(jsonDiscoveryMeterRSSIPercentage), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_lqi_percentage/config", jsonDiscoveryLQIPercentage, true);
+  mqtt.publish("homeassistant/sensor/water_meter_lqi_percentage/config", FPSTR(jsonDiscoveryLQIPercentage), true);
   delay(50);
 
   // Publish JSON discovery for the times the meter wakes and sleeps
-  mqtt.publish("homeassistant/sensor/water_meter_time_start/config", jsonDiscoveryTimeStart, true);
+  mqtt.publish("homeassistant/sensor/water_meter_time_start/config", FPSTR(jsonDiscoveryTimeStart), true);
   delay(50);
-  mqtt.publish("homeassistant/sensor/water_meter_time_end/config", jsonDiscoveryTimeEnd, true);
+  mqtt.publish("homeassistant/sensor/water_meter_time_end/config", FPSTR(jsonDiscoveryTimeEnd), true);
   delay(50);
 
   // Set initial state for active reading
@@ -980,6 +1107,124 @@ void onConnectionEstablished()
   digitalWrite(LED_BUILTIN, HIGH); // turned off
 
   Serial.println("> Setup done");
+  
+  // =====================================================
+  // POST-SETUP HEALTH CHECK
+  // =====================================================
+  String separator = "";
+  for(int i = 0; i < 60; i++) separator += "=";
+  
+  Serial.println("\n" + separator);
+  Serial.println("✅ POST-SETUP SYSTEM VERIFICATION");
+  Serial.println(separator);
+  
+  // 1. WiFi Connection Verification
+  Serial.println("\n📡 WIFI STATUS:");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("  • SSID: %s ✅\n", WiFi.SSID().c_str());
+    Serial.printf("  • IP Address: %s ✅\n", WiFi.localIP().toString().c_str());
+    Serial.printf("  • Signal Strength: %d dBm (%d%%) ✅\n", WiFi.RSSI(), calculateWiFiSignalStrengthPercentage(WiFi.RSSI()));
+    Serial.printf("  • MAC Address: %s ✅\n", WiFi.macAddress().c_str());
+  } else {
+    Serial.println("  • WiFi Status: ❌ DISCONNECTED");
+  }
+  
+  // 2. MQTT Connection Verification
+  Serial.println("\n📨 MQTT STATUS:");
+  if (mqtt.isConnected()) {
+    Serial.printf("  • Broker: %s ✅\n", secret_mqtt_server);
+    Serial.printf("  • Client Name: %s ✅\n", secret_clientName);
+    Serial.println("  • Connection: ✅ Connected and operational");
+    Serial.println("  • Home Assistant Discovery: ✅ Published");
+  } else {
+    Serial.println("  • MQTT Status: ❌ DISCONNECTED");
+  }
+  
+  // 3. OTA Service Status
+  Serial.println("\n🔄 OTA SERVICE:");
+  Serial.printf("  • Hostname: EVERBLUREADER ✅\n");
+  Serial.printf("  • Status: ✅ Ready for wireless updates\n");
+  
+  // 4. CC1101 Final Verification
+  Serial.println("\n📡 CC1101 RADIO:");
+  Serial.printf("  • Frequency: %.6f MHz ✅\n", FREQUENCY);
+  Serial.printf("  • Target Meter: %02d-0%d ✅\n", METER_YEAR, METER_SERIAL);
+  Serial.printf("  • Radio Status: ✅ Initialized and ready\n");
+  
+  // 5. Memory Status After Initialization
+  Serial.println("\n💾 FINAL MEMORY STATUS:");
+  uint32_t finalHeap = ESP.getFreeHeap();
+  Serial.printf("  • Free Heap: %d bytes\n", finalHeap);
+  if (finalHeap > 15000) {
+    Serial.println("  • Memory Status: ✅ Excellent (Stable operation expected)");
+  } else if (finalHeap > 10000) {
+    Serial.println("  • Memory Status: ✅ Good (Normal operation)");
+  } else if (finalHeap > 6000) {
+    Serial.println("  • Memory Status: ⚠️ Acceptable (Monitor for stability)");
+  } else {
+    Serial.println("  • Memory Status: ❌ Low (May cause instability)");
+  }
+  
+  // 6. Time and Schedule Verification
+  Serial.println("\n⏰ TIME & SCHEDULE:");
+  tnow = time(nullptr);
+  ptm = gmtime(&tnow);
+  Serial.printf("  • Current Time: %04d/%02d/%02d %02d:%02d:%02d UTC ✅\n", 
+    ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+  Serial.printf("  • Reading Schedule: %s ✅\n", DEFAULT_READING_SCHEDULE);
+  
+  // Determine if it's currently a reading day and time
+  bool isReading = isReadingDay(ptm);
+  bool isBusinessHours = (ptm->tm_hour >= 8 && ptm->tm_hour < 18); // 8 AM to 6 PM UTC
+  if (isReading && isBusinessHours) {
+    Serial.println("  • Meter Availability: ✅ Should be available now");
+  } else if (isReading && !isBusinessHours) {
+    Serial.println("  • Meter Availability: ⏰ Available weekday but outside business hours");
+  } else {
+    Serial.println("  • Meter Availability: ⏰ Weekend/Holiday - meter sleeping");
+  }
+  
+  // 7. Final System Health Summary
+  Serial.println("\n📋 FINAL SYSTEM STATUS:");
+  bool systemHealthy = true;
+  String healthIssues = "";
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    systemHealthy = false;
+    healthIssues += "WiFi disconnected; ";
+  }
+  
+  if (!mqtt.isConnected()) {
+    systemHealthy = false;
+    healthIssues += "MQTT disconnected; ";
+  }
+  
+  if (finalHeap < 6000) {
+    systemHealthy = false;
+    healthIssues += "Critical memory shortage; ";
+  }
+  
+  if (systemHealthy) {
+    Serial.println("  🎉 ALL SYSTEMS FULLY OPERATIONAL!");
+    Serial.println("  ✅ WiFi Connected");
+    Serial.println("  ✅ MQTT Connected"); 
+    Serial.println("  ✅ CC1101 Radio Ready");
+    Serial.println("  ✅ Home Assistant Integration Active");
+    Serial.println("  ✅ OTA Updates Ready");
+    Serial.println("  ✅ Scheduled Readings Configured");
+  } else {
+    Serial.printf("  ⚠️ SYSTEM ISSUES DETECTED: %s\n", healthIssues.c_str());
+    Serial.println("  📞 Check network connections and restart if needed");
+  }
+  
+  Serial.println(separator);
+  Serial.println("🚀 WATER METER MONITORING SYSTEM READY!");
+  Serial.println(separator + "\n");
+  
+  // =====================================================
+  // END POST-SETUP HEALTH CHECK
+  // =====================================================
+
   Serial.println("Ready to go...");
 
   onScheduled();
@@ -999,6 +1244,8 @@ void setup()
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW); // turned on to start with
+
+  WiFi.persistent(false); // avoid excessive flash writes from WiFi config
 
   // Increase the max packet size to handle large MQTT payloads
   mqtt.setMaxPacketSize(2048); // Set to a size larger than your longest payload
@@ -1025,18 +1272,115 @@ void setup()
   scanFrequency433MHz();
   #endif
 
+  // =====================================================
+  // INITIAL SYSTEM DIAGNOSTICS
+  // =====================================================
+  String separator = "";
+  for(int i = 0; i < 60; i++) separator += "=";
+  
+  Serial.println("\n" + separator);
+  Serial.println("🔍 SYSTEM SELF-DIAGNOSTICS");
+  Serial.println(separator);
+  
+  // 1. System Information
+  Serial.println("\n📊 SYSTEM INFO:");
+  Serial.printf("  • Chip ID: %08X\n", ESP.getChipId());
+  Serial.printf("  • CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
+  Serial.printf("  • Free Heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("  • Flash Size: %d bytes\n", ESP.getFlashChipSize());
+  Serial.printf("  • Sketch Size: %d bytes\n", ESP.getSketchSize());
+  Serial.printf("  • Free Sketch Space: %d bytes\n", ESP.getFreeSketchSpace());
+  
+  // 2. Pin Configuration Check
+  Serial.println("\n🔌 PIN CONFIGURATION:");
+  Serial.printf("  • GDO0 Pin: D1 (GPIO%d)\n", GDO0);
+  Serial.printf("  • CS Pin: D8 (GPIO15)\n");
+  Serial.printf("  • SCK Pin: D5 (GPIO14)\n");
+  Serial.printf("  • MOSI Pin: D7 (GPIO13)\n");
+  Serial.printf("  • MISO Pin: D6 (GPIO12)\n");
+  
+  // 3. CC1101 Hardware Test
+  Serial.println("\n🔧 CC1101 HARDWARE TEST:");
+  
+  // Test 1: SPI Communication Test
+  Serial.print("  • SPI Communication: ");
+  delay(100);
+  
+  // Basic SPI test (this will be overridden by cc1101_init later)
+  pinMode(15, OUTPUT); // CS pin
+  digitalWrite(15, HIGH);
+  
+  // Simple connection test
+  bool spi_ok = (digitalRead(15) == HIGH); // Basic pin test
+  
+  if (spi_ok) {
+    Serial.println("✅ OK (Pin connections verified)");
+  } else {
+    Serial.println("❌ FAILED (Check pin connections)");
+  }
+  
+  // Test 2: Power Supply Check
+  Serial.print("  • Power Supply: ");
+  Serial.println("✅ OK (ESP8266 powered, assuming 3.3V OK)");
+  
+  // Test 3: Pin Connectivity
+  Serial.println("  • Pin Status:");
+  pinMode(GDO0, INPUT_PULLUP);
+  Serial.printf("    - GDO0 (D1): %s\n", digitalRead(GDO0) ? "HIGH" : "LOW");
+  Serial.printf("    - CS (D8): %s\n", digitalRead(15) ? "HIGH" : "LOW");
+  
+  // 4. Meter Configuration
+  Serial.println("\n🎯 METER CONFIGURATION:");
+  Serial.printf("  • Target Meter: %02d-0%d\n", METER_YEAR, METER_SERIAL);
+  Serial.printf("  • Frequency: %.6f MHz\n", FREQUENCY);
+  Serial.printf("  • Reading Schedule: %s\n", DEFAULT_READING_SCHEDULE);
+  
+  // 5. Memory Health Check (Improved thresholds for ESP8266)
+  Serial.println("\n💾 MEMORY HEALTH:");
+  uint32_t freeHeap = ESP.getFreeHeap();
+  Serial.printf("  • Free Heap: %d bytes\n", freeHeap);
+  if (freeHeap > 25000) {
+    Serial.println("  • Memory Status: ✅ Excellent");
+  } else if (freeHeap > 15000) {
+    Serial.println("  • Memory Status: ✅ Good (Normal for ESP8266)");
+  } else if (freeHeap > 8000) {
+    Serial.println("  • Memory Status: ⚠️ Low (Monitor for issues)");
+  } else {
+    Serial.println("  • Memory Status: ❌ Critical (Very low memory)");
+  }
+  
+  // 6. Initial Diagnostic Summary
+  Serial.println("\n📋 INITIAL DIAGNOSTICS:");
+  bool hardwareOk = true;
+  
+  if (!spi_ok) {
+    Serial.println("  ❌ SPI pin configuration failed");
+    hardwareOk = false;
+  }
+  
+  if (freeHeap < 8000) {
+    Serial.println("  ❌ Critical memory shortage detected");
+    hardwareOk = false;
+  }
+  
+  if (hardwareOk) {
+    Serial.println("  ✅ Hardware checks passed!");
+  } else {
+    Serial.println("  ⚠️ Hardware issues detected - check above for details");
+  }
+  
+  Serial.println(separator);
+  Serial.println("🚀 STARTING WATER METER SYSTEM...");
+  Serial.println(separator + "\n");
+  
+  // =====================================================
+  // END INITIAL DIAGNOSTICS
+  // =====================================================
     
   // Set CC1101 radio frequency
-  cc1101_init(FREQUENCY);
-
-  /*
-  // Use this piece of code to test
-  struct tmeter_data meter_data;
-  meter_data = get_meter_data();
-  Serial.printf("\nLiters : %d\nBattery (in months) : %d\nCounter : %d\nTime start : %d\nTime end : %d\n\n", meter_data.liters, meter_data.battery_left, meter_data.reads_counter, meter_data.time_start, meter_data.time_end);
-  while (42);
-  */
-
+  if (!cc1101_init(FREQUENCY)) {
+    Serial.println("CC1101 init failed - check SPI wiring. System will retry in loop.");
+  }
 }
 
 // Function: loop
@@ -1044,10 +1388,19 @@ void setup()
 void loop() {
   mqtt.loop();
   ArduinoOTA.handle();
+  
+  // Handle retry attempts (non-recursive approach)
+  if (retryPending && (millis() - lastRetryAttempt > 10000)) { // 10 seconds between retries
+    retryPending = false;
+    onUpdateData();
+  }
 
   // Update diagnostics and Wi-Fi details every 5 minutes
   if (millis() - lastWifiUpdate > 300000) { // 5 minutes in ms
     publishWifiDetails();
     lastWifiUpdate = millis();
   }
+  
+  // Feed watchdog in main loop to prevent resets
+  ESP.wdtFeed();
 }

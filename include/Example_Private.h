@@ -13,6 +13,9 @@
 // NTP server for time synchronization
 #define secret_local_timeclock_server "pool.ntp.org" // NTP Server Address
 
+// OTA (Over-The-Air) update password - set to protect wireless firmware updates
+#define secret_ota_password "your_ota_password"
+
 // Enable 11G Wi-Fi PHY mode (set to 1 to enable, 0 to disable)
 #define ENABLE_WIFI_PHY_MODE_11G 0
 

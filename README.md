@@ -66,11 +66,29 @@ Pin wiring for the [Wemos D1 board](https://www.wemos.cc/en/latest/d1/index.html
 | GDO2        | D2        | GPIO4              | Another general-purpose digital output.       |
 | GND         | G         | GND                | Connect to ground.                            |
 
+
+
+NodeMCU v3          CC1101 Module (TinyTronics)
+                   [Antenna connected to SMA]
+                   
+3V3 ──────────────── VCC (Pin 2)
+GND ──────────────── GND (Pin 1)
+D1 (GPIO5) ───────── GDO0 (Pin 3)
+D8 (GPIO15) ──────── CSN (Pin 4)  
+D5 (GPIO14) ──────── SCK (Pin 5)
+D7 (GPIO13) ──────── MOSI (Pin 6)
+D6 (GPIO12) ──────── MISO/GDO1 (Pin 7)
+D2 (GPIO4) ───────── GDO2 (Pin 8)
+
 ### CC1101
 
 Some modules are not labeled on the PCB. Below is the pinout for one:
 ![CC1101 pinout diagram](imgs/cc1101-mapping.png)
 ![CC1101 example](imgs/cc1101.jpg)
+
+### 3D Print box model
+
+https://www.thingiverse.com/thing:4795566
 
 ---
 
@@ -166,6 +184,16 @@ Your transceiver module may not be calibrated correctly. Adjust the frequency sl
 
 > [!NOTE]
 > This is particularly relevant in the UK.
+
+### No data showing in Home Assistant (ESP publishes successfully)
+
+If the serial console shows successful meter reads and "JSON data published successfully" but entities in Home Assistant are missing or show "unavailable":
+
+1. **Same MQTT broker** — Home Assistant must use the **same** broker as the ESP (e.g. `192.168.1.45`). Check **Settings → Devices & services → MQTT** and confirm the broker host/port matches `private.h`.
+2. **MQTT integration** — Ensure the MQTT integration is added and connected. Discovery is enabled by default.
+3. **Look for the device** — Go to **Settings → Devices & services → MQTT → [your broker] → Devices** (or **Entities**) and find the "Water Meter" device. Entities may be in a different area or disabled.
+4. **Availability topic** — Entities use `everblu/cyble/status` as availability. The ESP publishes `online` when connected and after a successful read; if the broker still has a retained `offline` (e.g. from a previous session), power-cycle the ESP and wait for "Setup done" so it publishes `online` again.
+5. **Update frequency after scan** — If you ran frequency discovery, set `SCAN_FREQUENCY_433MHZ` back to `0` and update `FREQUENCY` in `private.h` to the recommended value (e.g. `433.821899`) so future reads use the correct frequency.
 
 ### Serial Number Starting with 0
 
