@@ -980,6 +980,9 @@ void onConnectionEstablished()
     }
   });
   ArduinoOTA.setHostname("EVERBLUREADER");
+#ifdef secret_ota_password
+  ArduinoOTA.setPassword(secret_ota_password);
+#endif
   ArduinoOTA.begin();
   Serial.println("> Ready");
   Serial.print("> IP address: ");
