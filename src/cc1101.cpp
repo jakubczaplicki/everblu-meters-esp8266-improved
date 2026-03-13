@@ -24,7 +24,7 @@ uint8_t debug_out = 0;
 #endif
 
 #ifndef FALSE
-#define FALSE true
+#define FALSE false
 #endif
 
 #define TX_LOOP_OUT 300
