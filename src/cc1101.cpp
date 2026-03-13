@@ -2,10 +2,11 @@
 /*  it is exposed just to demonstrate CC1101 capability to reader water meter indexes */
 /*  there is no Warranty on radian_trx SW */
 
-#include "private.h"        // Include the local private file for passwords etc. not for GitHub. Generate your own private.h file with the same content as private_example.h
-#include "everblu_meters.h" // Include the local everblu_meters library
-#include "utils.h"          // Include the local utils library for utility functions
-#include "cc1101.h"         // Include the local cc1101 library for CC1101 functions
+#include "private.h"          // Passwords etc. - copy from Example_Private.h
+#include "everblu_meters.h"
+#include "utils.h"
+#include "cc1101.h"
+#include "radian_constants.h"
 #include <Arduino.h>        // Include the Arduino library for basic functions
 #include <SPI.h>            // Include the SPI library for SPI communication
 
@@ -521,20 +522,19 @@ struct tmeter_data parse_meter_report(uint8_t *decoded_buffer, uint8_t size)
 {
   struct tmeter_data data;
   memset(&data, 0, sizeof(data));
-  if (size >= 30)
+  if (size >= METER_REPORT_MIN_SIZE_LITERS)
   {
-    //echo_debug(1,"\n%u/%u/20%u %u:%u:%u ",decoded_buffer[24],decoded_buffer[25],decoded_buffer[26],decoded_buffer[28],decoded_buffer[29],decoded_buffer[30]);
-    //echo_debug(1,"%u liters ",decoded_buffer[18]+decoded_buffer[19]*256 + decoded_buffer[20]*65536 + decoded_buffer[21]*16777216);
-
-    data.liters = decoded_buffer[18] + decoded_buffer[19] * 256 + decoded_buffer[20] * 65536 + decoded_buffer[21] * 16777216;
+    data.liters = decoded_buffer[METER_REPORT_OFFSET_LITERS_0]
+        + (decoded_buffer[METER_REPORT_OFFSET_LITERS_1] << 8)
+        + (decoded_buffer[METER_REPORT_OFFSET_LITERS_2] << 16)
+        + (decoded_buffer[METER_REPORT_OFFSET_LITERS_3] << 24);
   }
-  if (size >= 48)
+  if (size >= METER_REPORT_MIN_SIZE_EXTRA)
   {
-    //echo_debug(1,"Num %u %u Mois %uh-%uh ",decoded_buffer[48], decoded_buffer[31],decoded_buffer[44],decoded_buffer[45]);
-    data.reads_counter = decoded_buffer[48];
-    data.battery_left = decoded_buffer[31];
-    data.time_start = decoded_buffer[44];
-    data.time_end = decoded_buffer[45];
+    data.reads_counter = decoded_buffer[METER_REPORT_OFFSET_READS_CTR];
+    data.battery_left = decoded_buffer[METER_REPORT_OFFSET_BATTERY];
+    data.time_start = decoded_buffer[METER_REPORT_OFFSET_TIME_START];
+    data.time_end = decoded_buffer[METER_REPORT_OFFSET_TIME_END];
   }
   return data;
 }
@@ -617,10 +617,9 @@ int receive_radian_frame(int size_byte, int rx_tmo_ms, uint8_t*rxBuffer, int rxB
   if (l_radian_frame_size_byte * 4 > rxBuffer_size) { echo_debug(debug_out, "buffer too small\n"); return 0; }
   CC1101_CMD(SFRX);
   halRfWriteReg(MCSM1, 0x0F);   //CCA always ; default mode RX
-  halRfWriteReg(MDMCFG2, 0x02); //Modem Configuration   2-FSK;  no Manchester ; 16/16 sync word bits detected   
-  /* configure to receive beginning of sync pattern */
-  halRfWriteReg(SYNC1, 0x55);   //01010101
-  halRfWriteReg(SYNC0, 0x50);   //01010000	
+  halRfWriteReg(MDMCFG2, 0x02); //Modem Configuration   2-FSK;  no Manchester ; 16/16 sync word bits detected
+  halRfWriteReg(SYNC1, RADIAN_SYNC_PHASE1_H);
+  halRfWriteReg(SYNC0, RADIAN_SYNC_PHASE1_L);
   halRfWriteReg(MDMCFG4, 0xF6); //Modem Configuration   RX filter BW = 58Khz
   halRfWriteReg(MDMCFG3, 0x83); //Modem Configuration   26M*((256+83h)*2^6)/2^28 = 2.4kbps	
   halRfWriteReg(PKTLEN, 1); // just one byte of synch pattern
@@ -683,8 +682,8 @@ int receive_radian_frame(int size_byte, int rx_tmo_ms, uint8_t*rxBuffer, int rxB
   echo_debug(debug_out, " rssi=%u lqi=%u F_est=%u \n", l_Rssi_dbm, l_lqi, l_freq_est);
 
   fflush(stdout);
-  halRfWriteReg(SYNC1, 0xFF);   //11111111
-  halRfWriteReg(SYNC0, 0xF0);   //11110000 la fin du synch pattern et le bit de start
+  halRfWriteReg(SYNC1, RADIAN_SYNC_PHASE2_H);
+  halRfWriteReg(SYNC0, RADIAN_SYNC_PHASE2_L);
   halRfWriteReg(MDMCFG4, 0xF8); //Modem Configuration   RX filter BW = 58Khz
   halRfWriteReg(MDMCFG3, 0x83); //Modem Configuration   26M*((256+83h)*2^8)/2^28 = 9.59kbps
   halRfWriteReg(PKTCTRL0, 0x02); //infinite packet len
@@ -735,8 +734,8 @@ int receive_radian_frame(int size_byte, int rx_tmo_ms, uint8_t*rxBuffer, int rxB
   halRfWriteReg(MDMCFG3, 0x83); //Modem Configuration   26M*((256+83h)*2^6)/2^28 = 2.4kbps
   halRfWriteReg(PKTCTRL0, 0x00); //fix packet len
   halRfWriteReg(PKTLEN, 38);
-  halRfWriteReg(SYNC1, 0x55);   //01010101
-  halRfWriteReg(SYNC0, 0x00);   //00000000
+  halRfWriteReg(SYNC1, RADIAN_SYNC_DEFAULT_H);
+  halRfWriteReg(SYNC0, RADIAN_SYNC_DEFAULT_L);
   return l_total_byte;
 }
 
@@ -847,7 +846,7 @@ struct tmeter_data get_meter_data(void)
   uint8_t lqi1 = halRfReadReg(LQI_ADDR);
   Serial.printf("Pre-receive RSSI: %d dBm, LQI: %d\n", cc1100_rssi_convert2dbm(rssi1), lqi1);
   
-  if (!receive_radian_frame(0x12, 150, rxBuffer, sizeof(rxBuffer))) {
+  if (!receive_radian_frame(RADIAN_ACK_FRAME_SIZE, 150, rxBuffer, sizeof(rxBuffer))) {
     echo_debug(debug_out, "TMO on REC\n");
     Serial.println("First frame timeout - no ACK received from meter");
   } else {
@@ -861,7 +860,7 @@ struct tmeter_data get_meter_data(void)
   uint8_t lqi2 = halRfReadReg(LQI_ADDR);
   Serial.printf("Pre-receive RSSI: %d dBm, LQI: %d\n", cc1100_rssi_convert2dbm(rssi2), lqi2);
   
-  rxBuffer_size = receive_radian_frame(0x7C, 1000, rxBuffer, sizeof(rxBuffer)); // Increased from 700ms to 1000ms to allow full meter response
+  rxBuffer_size = receive_radian_frame(RADIAN_DATA_FRAME_SIZE, 1000, rxBuffer, sizeof(rxBuffer));
   if (rxBuffer_size)
   {
     Serial.printf("Second frame (DATA) received successfully - %d bytes\n", rxBuffer_size);
